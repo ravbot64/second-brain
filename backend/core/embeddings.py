@@ -1,4 +1,3 @@
-from sentence_transformers import SentenceTransformer
 from typing import List
 
 class EmbeddingService:
@@ -8,6 +7,7 @@ class EmbeddingService:
 
     def _load(self):
         if self._model is None:
+            from sentence_transformers import SentenceTransformer
             self._model = SentenceTransformer(self._model_name)
 
     def get_embedding(self, text: str) -> List[float]:
