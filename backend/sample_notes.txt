@@ -1,0 +1,15 @@
+PRODUCT DESIGN NOTES - 2026-03-11
+
+Concept: "Second Brain" App
+- It should integrate with systems like Notion and Apple Notes.
+- Key differentiator: semantic search and agentic AI behaviors instead of simple RAG.
+- Architecture uses FastAPI, Next.js, and local Embeddings using sentence-transformers (all-MiniLM-L6-v2) for ultra-fast performance.
+- Qdrant is the chosen Vector Database because of its Rust-based speed and easy local SQLite persistence setup.
+
+Meeting Notes with Engineering Team (March 10):
+- Discussed handling chunking sizes. We settled on 500-word chunks with 50-word overlap initially.
+- Explored hybrid search, eventually we might add BM25.
+- Connectors architecture: Built a BaseConnector interface so adding new sources like Obsidian or Google Drive later is trivial.
+
+User Feedback from Prototype:
+"I love the glassmorphism dark theme UI! It feels very premium and instantly sets apart from basic boilerplate Chat apps."
