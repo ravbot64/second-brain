@@ -52,9 +52,16 @@ app.include_router(router, prefix="/api")
 
 @app.on_event("startup")
 async def startup_init_datastores():
-    # Ensure required DB table and vector collection exist in fresh deployments.
-    init_postgres()
-    init_qdrant()
+    # Avoid hard-failing app startup if a managed service is temporarily unreachable.
+    try:
+        init_postgres()
+    except Exception as e:
+        print(f"Startup warning: Postgres init failed: {e}")
+
+    try:
+        init_qdrant()
+    except Exception as e:
+        print(f"Startup warning: Qdrant init failed: {e}")
 
 @app.get("/")
 def read_root():
