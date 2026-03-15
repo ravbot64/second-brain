@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from api.router import router
 from core.config import settings
+from core.init_db import init_postgres, init_qdrant
 
 app = FastAPI(title="Second Brain API", version="1.0.0")
 
@@ -48,6 +49,12 @@ async def rate_limit_middleware(request, call_next):
     return response
 
 app.include_router(router, prefix="/api")
+
+@app.on_event("startup")
+async def startup_init_datastores():
+    # Ensure required DB table and vector collection exist in fresh deployments.
+    init_postgres()
+    init_qdrant()
 
 @app.get("/")
 def read_root():
