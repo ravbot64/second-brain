@@ -5,7 +5,7 @@ pydantic-settings
 sqlalchemy
 psycopg2-binary
 qdrant-client
-sentence-transformers
+fastembed
 google-genai
 pypdf
 python-multipart
