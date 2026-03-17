@@ -7,8 +7,12 @@ class EmbeddingService:
     def _load(self):
         if self._client is None:
             from google import genai
+            from google.genai import types
             from .config import settings
-            self._client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+            self._client = genai.Client(
+                api_key=settings.GOOGLE_API_KEY,
+                http_options=types.HttpOptions(api_version='v1')
+            )
 
     def get_embedding(self, text: str) -> List[float]:
         self._load()
