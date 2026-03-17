@@ -645,7 +645,7 @@ export default function Home() {
           <div>
             <p className="text-[10px] font-semibold text-zinc-700 uppercase tracking-widest px-2 mb-1.5">Coming Soon</p>
             <div className="space-y-0.5 opacity-35 pointer-events-none select-none">
-              {["Notion Workspace", "Apple Notes", "Google Keep"].map((name) => (
+              {["Notion Workspace", "Google Workspace"].map((name) => (
                 <div key={name} className="flex items-center gap-2.5 px-3 py-2 rounded-xl text-zinc-600">
                   <span className="w-2 h-2 rounded-full bg-zinc-800 flex-shrink-0" />
                   <span className="text-sm">{name}</span>
