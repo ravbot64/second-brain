@@ -7,6 +7,7 @@ class EmbeddingService:
         self._client = None
         self._model = None
         self._dim = 384
+        self._remote_available = True
 
     def _load(self):
         if self._client is None:
@@ -66,9 +67,13 @@ class EmbeddingService:
         raise RuntimeError(f"Remote embedding failed for all candidate models: {last_error}")
 
     def get_embedding(self, text: str) -> List[float]:
+        if not self._remote_available:
+            return self._local_fallback_embedding(text)
+
         try:
             return self._remote_embedding(text)
         except Exception as e:
+            self._remote_available = False
             print(f"Embedding API unavailable, using local fallback: {e}")
             return self._local_fallback_embedding(text)
 
