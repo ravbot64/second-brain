@@ -16,11 +16,31 @@ class UploadFileConnector(BaseConnector):
         try:
             content = ""
             filename_lower = self.filename.lower()
+
+            def read_plain_text(path: str) -> str:
+                """Read text files robustly, including extension-less UTF-8 files."""
+                with open(path, "rb") as f:
+                    raw = f.read()
+
+                # Reject likely-binary files early.
+                if b"\x00" in raw:
+                    raise ValueError("Unsupported file type")
+
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    # Fallback for common Windows-encoded text files.
+                    text = raw.decode("cp1252")
+
+                printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
+                ratio = (printable / len(text)) if text else 0
+                if text and ratio < 0.85:
+                    raise ValueError("Unsupported file type")
+                return text
             
             # Basic text parsing
             if filename_lower.endswith((".txt", ".md", ".csv")):
-                with open(self.file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
+                content = read_plain_text(self.file_path)
             
             # PDF parsing
             elif filename_lower.endswith(".pdf"):
@@ -35,7 +55,8 @@ class UploadFileConnector(BaseConnector):
 
                     content = "\n\n".join(page_texts)
             else:
-                raise ValueError("Unsupported file type")
+                # Allow extension-less (or unknown extension) uploads if content is plain text.
+                content = read_plain_text(self.file_path)
 
             if not content.strip():
                 raise ValueError(

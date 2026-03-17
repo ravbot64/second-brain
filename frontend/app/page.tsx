@@ -67,6 +67,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [mobileView, setMobileView] = useState<"history" | "chat" | "kb">("chat");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const errorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeIdRef = useRef(activeId);
@@ -123,6 +124,7 @@ export default function Home() {
     const conv = makeConv();
     setConversations((prev) => [conv, ...prev]);
     setActiveId(conv.id);
+    setMobileView("chat");
   };
 
   const deleteConversation = (id: string) => {
@@ -217,10 +219,14 @@ export default function Home() {
   };
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[#08080a] bg-grid">
+    <div className="flex flex-col lg:flex-row h-dvh lg:h-screen overflow-hidden bg-[#08080a] bg-grid">
       {/* ── LEFT: Chat History ── */}
       <aside
-        className="w-60 flex flex-col border-r border-white/[0.05] flex-shrink-0"
+        className={`flex flex-col flex-shrink-0 border-white/[0.05] ${
+          mobileView === "history"
+            ? "fixed inset-x-0 top-0 bottom-16 z-30 w-full border-r-0"
+            : "hidden"
+        } lg:static lg:z-auto lg:flex lg:w-60 lg:border-r`}
         style={{ background: "rgba(9,9,11,0.92)", backdropFilter: "blur(24px)" }}
       >
         {/* Logo */}
@@ -314,7 +320,7 @@ export default function Home() {
       </aside>
 
       {/* ── Main ── */}
-      <main className="flex-1 flex flex-col relative overflow-hidden">
+      <main className={`${mobileView === "chat" ? "flex" : "hidden"} lg:flex flex-1 flex-col relative overflow-hidden`}>
         {/* Error toast */}
         {error && (
           <div className="fixed top-4 right-4 z-50 max-w-sm bg-red-950/95 border border-red-800/50 rounded-xl px-4 py-3 text-red-200 text-sm shadow-2xl toast-animate">
@@ -339,12 +345,32 @@ export default function Home() {
           className="relative z-10 h-14 flex items-center justify-between px-5 border-b border-white/[0.05] flex-shrink-0"
           style={{ background: "rgba(8,8,10,0.85)", backdropFilter: "blur(24px)" }}
         >
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="lg:hidden flex items-center gap-1">
+              <button
+                onClick={() => setMobileView("history")}
+                className="p-2 text-zinc-500 hover:text-zinc-300 rounded-lg hover:bg-white/[0.05]"
+                title="Open chats"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
+                </svg>
+              </button>
+              <button
+                onClick={() => setMobileView("kb")}
+                className="p-2 text-zinc-500 hover:text-zinc-300 rounded-lg hover:bg-white/[0.05]"
+                title="Open knowledge base"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                </svg>
+              </button>
+            </div>
             <span className="relative flex h-1.5 w-1.5">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-60" />
               <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-blue-500" />
             </span>
-            <span className="text-sm font-medium text-zinc-300">Agentic RAG Engine</span>
+            <span className="text-sm font-medium text-zinc-300 truncate">Agentic RAG Engine</span>
             <span className="hidden sm:inline-flex text-[10px] px-2 py-0.5 rounded-full bg-white/[0.05] text-zinc-600 font-medium border border-white/[0.04]">
               Gemini 2.5
             </span>
@@ -363,7 +389,7 @@ export default function Home() {
         </header>
 
         {/* ── Chat history ── */}
-        <div className="flex-1 overflow-y-auto custom-scrollbar px-4 md:px-8 py-8 pb-36 relative z-10">
+        <div className="flex-1 overflow-y-auto custom-scrollbar px-3 sm:px-4 md:px-8 py-5 md:py-8 pb-44 md:pb-36 relative z-10">
           {messages.length === 0 ? (
             /* Empty state */
             <div className="flex flex-col items-center justify-center h-full min-h-[400px] text-center">
@@ -469,7 +495,7 @@ export default function Home() {
         </div>
 
         {/* ── Input bar ── */}
-        <div className="absolute bottom-0 left-0 right-0 z-20 px-4 md:px-8 pb-6 pt-16 bg-gradient-to-t from-[#08080a] via-[#08080a]/90 to-transparent">
+        <div className="absolute bottom-0 left-0 right-0 z-20 px-3 sm:px-4 md:px-8 pb-20 md:pb-6 pt-10 md:pt-16 bg-gradient-to-t from-[#08080a] via-[#08080a]/90 to-transparent">
           <form onSubmit={handleSubmit} className="max-w-3xl mx-auto flex items-end gap-2">
 
             {/* File upload */}
@@ -577,7 +603,11 @@ export default function Home() {
 
       {/* ── RIGHT: Memory Banks + Brain Management ── */}
       <aside
-        className="w-56 flex flex-col border-l border-white/[0.05] flex-shrink-0"
+        className={`flex flex-col flex-shrink-0 border-white/[0.05] ${
+          mobileView === "kb"
+            ? "fixed inset-x-0 top-0 bottom-16 z-30 w-full border-l-0"
+            : "hidden"
+        } lg:static lg:z-auto lg:flex lg:w-56 lg:border-l`}
         style={{ background: "rgba(9,9,11,0.92)", backdropFilter: "blur(24px)" }}
       >
         <div className="h-14 px-4 border-b border-white/[0.05] flex items-center flex-shrink-0">
@@ -637,6 +667,29 @@ export default function Home() {
           </button>
         </div>
       </aside>
+
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-white/[0.08] bg-[#09090b]/95 backdrop-blur-xl">
+        <div className="grid grid-cols-3 gap-1 p-2">
+          <button
+            onClick={() => setMobileView("history")}
+            className={`px-3 py-2 rounded-xl text-xs font-medium transition-colors ${mobileView === "history" ? "bg-white/[0.1] text-zinc-100" : "text-zinc-500"}`}
+          >
+            Chats
+          </button>
+          <button
+            onClick={() => setMobileView("chat")}
+            className={`px-3 py-2 rounded-xl text-xs font-medium transition-colors ${mobileView === "chat" ? "bg-blue-600 text-white" : "text-zinc-500"}`}
+          >
+            Chat
+          </button>
+          <button
+            onClick={() => setMobileView("kb")}
+            className={`px-3 py-2 rounded-xl text-xs font-medium transition-colors ${mobileView === "kb" ? "bg-white/[0.1] text-zinc-100" : "text-zinc-500"}`}
+          >
+            Knowledge
+          </button>
+        </div>
+      </nav>
 
       <KnowledgeModal isOpen={isModalOpen} onClose={handleModalClose} />
       <AboutModal isOpen={isAboutOpen} onClose={() => setIsAboutOpen(false)} />
