@@ -9,8 +9,9 @@ from .connectors import BaseConnector
 from qdrant_client import models as qmodels
 
 class IngestionPipeline:
-    def __init__(self, connector: BaseConnector):
+    def __init__(self, connector: BaseConnector, user_id: str):
         self.connector = connector
+        self.user_id = user_id
         self.db = SessionLocal()
 
     def chunk_text(self, text: str) -> List[str]:
@@ -62,6 +63,7 @@ class IngestionPipeline:
                             vector=embedding,
                             payload={
                                 "document_id": doc.id,
+                                "user_id": self.user_id,
                                 "source": doc.source,
                                 "chunk_index": i,
                                 "content": text,
@@ -78,6 +80,7 @@ class IngestionPipeline:
                 # 3. Commit document metadata only after vector write succeeds.
                 db_doc = DBDocument(
                     id=doc.id,
+                    user_id=self.user_id,
                     source=doc.source,
                     content=doc.content,
                     metadata_=doc.metadata

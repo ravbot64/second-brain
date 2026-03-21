@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     QDRANT_API_KEY: str = ""  # Required if using cloud Qdrant
     
     GOOGLE_API_KEY: str = ""  # Google Gemini API key
+    JWT_SECRET: str = ""
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = 60 * 24 * 7
     
     CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
     CORS_ALLOW_CREDENTIALS: bool = True

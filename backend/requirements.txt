@@ -8,3 +8,5 @@ qdrant-client
 google-genai
 pypdf
 python-multipart
+python-jose[cryptography]
+email-validator

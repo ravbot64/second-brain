@@ -21,6 +21,14 @@ type Conversation = {
   createdAt: Date;
 };
 
+type AuthUser = {
+  id: string;
+  email: string;
+  is_guest: boolean;
+  full_name?: string;
+  bio?: string;
+};
+
 const SUGGESTED_PROMPTS = [
   "What are the main topics in my knowledge base?",
   "Summarize what I know about machine learning",
@@ -46,13 +54,52 @@ export default function Home() {
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string>("");
+  const [historyReady, setHistoryReady] = useState(false);
 
-  useEffect(() => {
+  const ensureConversation = () => {
     const first = makeConv();
     setConversations([first]);
     setActiveId(first.id);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  };
+
+  const hydrateConversation = (raw: {
+    id: string;
+    title: string;
+    created_at?: string;
+    messages?: Array<{
+      id: string;
+      role: string;
+      content: string;
+      sources?: { score: number; source?: string }[];
+      timestamp?: string;
+    }>;
+  }): Conversation => ({
+    id: raw.id,
+    title: raw.title || "New conversation",
+    createdAt: raw.created_at ? new Date(raw.created_at) : new Date(),
+    messages: (raw.messages || []).map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      sources: m.sources,
+      timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+    })),
+  });
+
+  const createRemoteConversation = async (): Promise<Conversation | null> => {
+    const res = await authFetch(`${API_BASE_URL}/api/history/conversations`, {
+      method: "POST",
+    });
+    if (res.status === 401) {
+      logout();
+      return null;
+    }
+    if (!res.ok) {
+      throw new Error("Failed to create conversation");
+    }
+    const data = await res.json();
+    return hydrateConversation(data);
+  };
 
   const activeConversation = conversations.find((c) => c.id === activeId);
   const messages = activeConversation?.messages ?? [];
@@ -68,9 +115,28 @@ export default function Home() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<"history" | "chat" | "kb">("chat");
+  const [token, setToken] = useState("");
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authFullName, setAuthFullName] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [profileName, setProfileName] = useState("");
+  const [profileBio, setProfileBio] = useState("");
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileDeleting, setProfileDeleting] = useState(false);
+  const [isDeleteSheetOpen, setIsDeleteSheetOpen] = useState(false);
+  const [deletePassword, setDeletePassword] = useState("");
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [isCreatingNewChat, setIsCreatingNewChat] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const errorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeIdRef = useRef(activeId);
+  const newChatClickLockRef = useRef(false);
   useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
 
   const showError = (msg: string) => {
@@ -79,10 +145,92 @@ export default function Home() {
     errorTimeoutRef.current = setTimeout(() => setError(null), 5000);
   };
 
+  const authFetch = (url: string, init?: RequestInit) => {
+    const headers = new Headers(init?.headers || {});
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    return fetch(url, { ...init, headers });
+  };
+
+  const persistSession = (nextToken: string, user: AuthUser) => {
+    setToken(nextToken);
+    setAuthUser(user);
+    localStorage.setItem("sb_token", nextToken);
+    localStorage.setItem("sb_user", JSON.stringify(user));
+  };
+
+  const logout = () => {
+    setToken("");
+    setAuthUser(null);
+    setHistoryReady(false);
+    localStorage.removeItem("sb_token");
+    localStorage.removeItem("sb_user");
+    ensureConversation();
+  };
+
+  useEffect(() => {
+    const storedToken = localStorage.getItem("sb_token");
+    const storedUser = localStorage.getItem("sb_user");
+    if (!storedToken || !storedUser) return;
+    try {
+      const parsed = JSON.parse(storedUser) as AuthUser;
+      setToken(storedToken);
+      setAuthUser(parsed);
+      setProfileName(parsed.full_name || "");
+      setProfileBio(parsed.bio || "");
+    } catch {
+      localStorage.removeItem("sb_token");
+      localStorage.removeItem("sb_user");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!authUser || !token) {
+      setHistoryReady(false);
+      return;
+    }
+
+    (async () => {
+      try {
+        const res = await authFetch(`${API_BASE_URL}/api/history`);
+        if (res.status === 401) {
+          logout();
+          return;
+        }
+        if (!res.ok) throw new Error("Failed to load history");
+        const data = await res.json();
+        const restored = (Array.isArray(data) ? data : []).map(hydrateConversation);
+
+        if (!restored.length) {
+          const created = await createRemoteConversation();
+          if (!created) return;
+          setConversations([created]);
+          setActiveId(created.id);
+          setHistoryReady(true);
+          return;
+        }
+
+        setConversations(restored);
+        setActiveId(restored[0].id);
+        setHistoryReady(true);
+      } catch (e) {
+        console.error(e);
+        showError("Failed to load chat history");
+        ensureConversation();
+        setHistoryReady(true);
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser?.id, token]);
+
   const checkDocumentCount = async (silent = false) => {
+    if (!token) return null;
     if (!silent) setIsKbLoading(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/documents`);
+      const res = await authFetch(`${API_BASE_URL}/api/documents`);
+      if (res.status === 401) {
+        logout();
+        return null;
+      }
       if (!res.ok) throw new Error("Failed to fetch docs");
       const data = await res.json();
       const nextCount = Array.isArray(data) ? data.length : 0;
@@ -96,12 +244,13 @@ export default function Home() {
     }
   };
 
-  useEffect(() => { checkDocumentCount(); }, []);
+  useEffect(() => { if (authUser) checkDocumentCount(); }, [authUser]);
 
   useEffect(() => {
+    if (!authUser) return;
     const id = setInterval(() => { checkDocumentCount(true); }, 12000);
     return () => clearInterval(id);
-  }, []);
+  }, [authUser]);
 
   const handleModalClose = () => {
     setIsModalOpen(false);
@@ -118,28 +267,61 @@ export default function Home() {
   const pushMessage = (convId: string, msg: Message) =>
     patchConv(convId, (c) => ({ ...c, messages: [...c.messages, msg] }));
 
-  const startNewChat = () => {
+  const startNewChat = async () => {
+    if (!token || isCreatingNewChat || newChatClickLockRef.current) return;
+    newChatClickLockRef.current = true;
+    setIsCreatingNewChat(true);
+
     // Don't open another blank chat if the active one is already empty
-    if (activeConversation && activeConversation.messages.length === 0) return;
-    const conv = makeConv();
-    setConversations((prev) => [conv, ...prev]);
-    setActiveId(conv.id);
-    setMobileView("chat");
+    if (activeConversation && activeConversation.messages.length === 0) {
+      setIsCreatingNewChat(false);
+      newChatClickLockRef.current = false;
+      return;
+    }
+
+    try {
+      const conv = await createRemoteConversation();
+      if (!conv) return;
+      setConversations((prev) => [conv, ...prev]);
+      setActiveId(conv.id);
+      setMobileView("chat");
+    } catch (e) {
+      console.error(e);
+      showError("Failed to create conversation");
+    } finally {
+      setIsCreatingNewChat(false);
+      newChatClickLockRef.current = false;
+    }
   };
 
-  const deleteConversation = (id: string) => {
-    setConversations((prev) => {
-      const next = prev.filter((c) => c.id !== id);
-      if (id === activeIdRef.current) {
-        if (next.length === 0) {
-          const fresh = makeConv();
-          setActiveId(fresh.id);
-          return [fresh];
-        }
-        setActiveId(next[0].id);
+  const deleteConversation = async (id: string) => {
+    if (!token) return;
+    try {
+      const res = await authFetch(`${API_BASE_URL}/api/history/conversations/${id}`, {
+        method: "DELETE",
+      });
+      if (res.status === 401) {
+        logout();
+        return;
       }
-      return next;
-    });
+      if (!res.ok) {
+        throw new Error("Failed to delete conversation");
+      }
+
+      setConversations((prev) => {
+        const next = prev.filter((c) => c.id !== id);
+        if (id === activeIdRef.current) {
+          if (next.length === 0) {
+            return [];
+          }
+          setActiveId(next[0].id);
+        }
+        return next;
+      });
+    } catch (e) {
+      console.error(e);
+      showError("Failed to delete conversation");
+    }
   };
 
   const formatRelativeTime = (date: Date) => {
@@ -153,8 +335,17 @@ export default function Home() {
   };
 
   const sendQuery = async (query: string) => {
-    if (!query.trim() || isLoading) return;
-    const currentId = activeIdRef.current;
+    if (!query.trim() || isLoading || !token) return;
+    let currentId = activeIdRef.current;
+
+    if (!currentId) {
+      const created = await createRemoteConversation();
+      if (!created) return;
+      setConversations((prev) => [created, ...prev]);
+      setActiveId(created.id);
+      currentId = created.id;
+    }
+
     const userMessage: Message = {
       id: crypto.randomUUID(),
       role: "user",
@@ -164,10 +355,10 @@ export default function Home() {
     setConversations((prev) =>
       prev.map((c) => {
         if (c.id !== currentId) return c;
-        const isFirst = c.messages.length === 0;
+        const hasUserMessage = c.messages.some((m) => m.role === "user");
         return {
           ...c,
-          title: isFirst ? query.slice(0, 42) + (query.length > 42 ? "…" : "") : c.title,
+          title: !hasUserMessage ? query.slice(0, 42) + (query.length > 42 ? "…" : "") : c.title,
           messages: [...c.messages, userMessage],
         };
       })
@@ -175,16 +366,27 @@ export default function Home() {
     setInput("");
     setIsLoading(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/chat`, {
+      const res = await authFetch(`${API_BASE_URL}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, conversation_id: currentId }),
       });
+      if (res.status === 401) {
+        logout();
+        throw new Error("Session expired. Please sign in again.");
+      }
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
         throw new Error(d.detail || `Chat failed: ${res.status}`);
       }
       const data = await res.json();
+      if (data.conversation_id && data.conversation_id !== currentId) {
+        currentId = data.conversation_id;
+        setActiveId(currentId);
+      }
+      if (data.conversation_title) {
+        patchConv(currentId, (c) => ({ ...c, title: data.conversation_title }));
+      }
       pushMessage(currentId, {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -218,6 +420,165 @@ export default function Home() {
     } catch {}
   };
 
+  const submitAuth = async (mode: "login" | "register") => {
+    setAuthError(null);
+    setAuthLoading(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/auth/${mode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: authEmail,
+          password: authPassword,
+          ...(mode === "register" ? { full_name: authFullName } : {}),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `${mode} failed`);
+      persistSession(data.access_token, data.user);
+      setProfileName(data.user?.full_name || "");
+      setProfileBio(data.user?.bio || "");
+      setAuthFullName("");
+      setAuthEmail("");
+      setAuthPassword("");
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : "Authentication failed");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const guestAuth = async () => {
+    setAuthError(null);
+    setAuthLoading(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/auth/guest`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || "Guest login failed");
+      persistSession(data.access_token, data.user);
+      setProfileName(data.user?.full_name || "");
+      setProfileBio(data.user?.bio || "");
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : "Guest login failed");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const saveProfile = async () => {
+    if (!token || !authUser || authUser.is_guest) return;
+    setProfileSaving(true);
+    setAuthError(null);
+    try {
+      const res = await authFetch(`${API_BASE_URL}/api/auth/profile`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ full_name: profileName, bio: profileBio }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || "Failed to update profile");
+      const updated = { ...(authUser || {}), ...data } as AuthUser;
+      setAuthUser(updated);
+      localStorage.setItem("sb_user", JSON.stringify(updated));
+      setIsProfileOpen(false);
+    } catch (e) {
+      showError(e instanceof Error ? e.message : "Failed to update profile");
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
+  const deleteAccount = async () => {
+    if (!token || !authUser) return;
+    setDeleteError(null);
+    if (authUser.is_guest && deleteConfirmText !== "DELETE") {
+      setDeleteError("Type DELETE to confirm account deletion.");
+      return;
+    }
+    if (!authUser.is_guest && !deletePassword.trim()) {
+      setDeleteError("Password is required to delete account.");
+      return;
+    }
+
+    setProfileDeleting(true);
+    try {
+      const res = await authFetch(`${API_BASE_URL}/api/auth/delete-account`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: deletePassword || undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || "Failed to delete account");
+
+      setIsDeleteSheetOpen(false);
+      setIsProfileOpen(false);
+      setDeletePassword("");
+      setDeleteConfirmText("");
+      setDeleteError(null);
+      logout();
+      showError("Account deleted successfully");
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : "Failed to delete account");
+    } finally {
+      setProfileDeleting(false);
+    }
+  };
+
+  if (!authUser) {
+    return (
+      <div className="min-h-dvh bg-[#08080a] bg-grid flex items-center justify-center p-4">
+        <div className="w-full max-w-md rounded-2xl border border-white/[0.08] bg-[#0e0e11]/95 p-6">
+          <h2 className="text-xl font-semibold text-white mb-1">Welcome to Second Brain</h2>
+          <p className="text-sm text-zinc-500 mb-6">Sign in to access your personal brain, or continue as guest.</p>
+
+          <div className="flex gap-2 mb-4 rounded-xl bg-white/[0.03] p-1 border border-white/[0.06]">
+            <button onClick={() => setAuthMode("login")} className={`flex-1 py-2 text-sm rounded-lg ${authMode === "login" ? "bg-blue-600 text-white" : "text-zinc-500"}`}>Login</button>
+            <button onClick={() => setAuthMode("register")} className={`flex-1 py-2 text-sm rounded-lg ${authMode === "register" ? "bg-blue-600 text-white" : "text-zinc-500"}`}>Sign up</button>
+          </div>
+
+          <div className="space-y-3">
+            {authMode === "register" && (
+              <input
+                value={authFullName}
+                onChange={(e) => setAuthFullName(e.target.value)}
+                placeholder="Full Name"
+                className="w-full rounded-xl bg-white/[0.03] border border-white/[0.08] px-3 py-2.5 text-sm text-white"
+              />
+            )}
+            <input
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              placeholder="Email"
+              className="w-full rounded-xl bg-white/[0.03] border border-white/[0.08] px-3 py-2.5 text-sm text-white"
+            />
+            <input
+              type="password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              placeholder="Password"
+              className="w-full rounded-xl bg-white/[0.03] border border-white/[0.08] px-3 py-2.5 text-sm text-white"
+            />
+            {authError && <p className="text-xs text-red-400">{authError}</p>}
+            <button
+              onClick={() => submitAuth(authMode)}
+              disabled={authLoading || !authEmail || !authPassword || (authMode === "register" && !authFullName.trim())}
+              className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-sm"
+            >
+              {authLoading ? "Please wait..." : authMode === "login" ? "Login" : "Create account"}
+            </button>
+            <button
+              onClick={guestAuth}
+              disabled={authLoading}
+              className="w-full py-2.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] disabled:opacity-40 text-zinc-200 text-sm"
+            >
+              Continue as Guest
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col lg:flex-row h-dvh lg:h-screen overflow-hidden bg-[#08080a] bg-grid">
       {/* ── LEFT: Chat History ── */}
@@ -246,12 +607,13 @@ export default function Home() {
         <div className="p-3 border-b border-white/[0.05]">
           <button
             onClick={startNewChat}
-            className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white/[0.05] hover:bg-white/[0.09] border border-white/[0.07] hover:border-white/[0.12] active:scale-[0.98] transition-all rounded-xl text-zinc-300 font-medium text-sm"
+              disabled={isCreatingNewChat}
+              className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white/[0.05] hover:bg-white/[0.09] border border-white/[0.07] hover:border-white/[0.12] active:scale-[0.98] transition-all rounded-xl text-zinc-300 font-medium text-sm disabled:opacity-60 disabled:cursor-not-allowed"
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
             </svg>
-            New Chat
+              {isCreatingNewChat ? "Creating..." : "New Chat"}
           </button>
         </div>
 
@@ -376,9 +738,32 @@ export default function Home() {
             </span>
           </div>
           <div className="flex items-center gap-1">
+            <span className="hidden md:inline-flex text-[10px] px-2 py-1 rounded-full bg-white/[0.08] text-zinc-300 border border-white/[0.12]">
+              {authUser.is_guest ? "Guest" : (authUser.full_name || authUser.email)}
+            </span>
+            {!authUser.is_guest && (
+              <button
+                onClick={() => setIsProfileOpen(true)}
+                className="p-2 text-zinc-500 hover:text-zinc-200 transition-colors rounded-lg hover:bg-white/[0.08]"
+                title="Profile"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" />
+                </svg>
+              </button>
+            )}
+            <button
+              onClick={logout}
+              className="p-2 text-zinc-500 hover:text-zinc-200 transition-colors rounded-lg hover:bg-white/[0.08]"
+              title="Logout"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
+              </svg>
+            </button>
             <button
               onClick={() => setIsAboutOpen(true)}
-              className="p-2 text-zinc-700 hover:text-zinc-400 transition-colors rounded-lg hover:bg-white/[0.05]"
+              className="p-2 text-zinc-500 hover:text-zinc-200 transition-colors rounded-lg hover:bg-white/[0.08]"
               title="About Second Brain"
             >
               <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -519,7 +904,11 @@ export default function Home() {
                   pushMessage(currentUploadId, { id: crypto.randomUUID(), role: "assistant", content: `Ingesting ${file.name}…`, timestamp: new Date() });
                   setIsLoading(true);
                   try {
-                    const res = await fetch(`${API_BASE_URL}/api/ingest/upload`, { method: "POST", body: formData });
+                    const res = await authFetch(`${API_BASE_URL}/api/ingest/upload`, { method: "POST", body: formData });
+                    if (res.status === 401) {
+                      logout();
+                      throw new Error("Session expired. Please sign in again.");
+                    }
                     if (res.ok) {
                       pushMessage(currentUploadId, {
                         id: crypto.randomUUID(),
@@ -693,6 +1082,146 @@ export default function Home() {
 
       <KnowledgeModal isOpen={isModalOpen} onClose={handleModalClose} />
       <AboutModal isOpen={isAboutOpen} onClose={() => setIsAboutOpen(false)} />
+
+      {isProfileOpen && authUser && !authUser.is_guest && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)" }}>
+          <div className="w-full max-w-md rounded-2xl border border-white/[0.08] bg-[#0e0e11]/95 p-5">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-base font-semibold text-white">Profile</h3>
+              <button onClick={() => setIsProfileOpen(false)} className="text-zinc-600 hover:text-zinc-300">×</button>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <p className="text-xs text-zinc-600 mb-1">Email</p>
+                <p className="text-sm text-zinc-300 break-all">{authUser.email}</p>
+              </div>
+              <div>
+                <p className="text-xs text-zinc-600 mb-1">Account Type</p>
+                <p className="text-sm text-zinc-300">Registered</p>
+              </div>
+
+              <div>
+                <p className="text-xs text-zinc-600 mb-1">Full Name</p>
+                <input
+                  value={profileName}
+                  onChange={(e) => setProfileName(e.target.value)}
+                  disabled={false}
+                  className="w-full rounded-xl bg-white/[0.03] border border-white/[0.08] px-3 py-2.5 text-sm text-white disabled:opacity-50"
+                />
+              </div>
+
+              <div>
+                <p className="text-xs text-zinc-600 mb-1">Bio</p>
+                <textarea
+                  value={profileBio}
+                  onChange={(e) => setProfileBio(e.target.value)}
+                  disabled={false}
+                  rows={3}
+                  className="w-full rounded-xl bg-white/[0.03] border border-white/[0.08] px-3 py-2.5 text-sm text-white disabled:opacity-50"
+                />
+              </div>
+
+              <button
+                onClick={saveProfile}
+                disabled={profileSaving}
+                className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm"
+              >
+                {profileSaving ? "Saving..." : "Save Profile"}
+              </button>
+              <button
+                onClick={() => setIsDeleteSheetOpen(true)}
+                disabled={profileDeleting}
+                className="w-full py-2.5 rounded-xl bg-red-600/90 hover:bg-red-500 disabled:opacity-50 text-white text-sm"
+              >
+                {profileDeleting ? "Deleting..." : "Delete Account"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isDeleteSheetOpen && authUser && !authUser.is_guest && (
+        <div className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center p-0 sm:p-4" style={{ background: "rgba(0,0,0,0.75)", backdropFilter: "blur(8px)" }}>
+          <div className="w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl border border-white/[0.08] bg-[#111114] p-5 sm:p-6 shadow-2xl">
+            <div className="w-10 h-1 rounded-full bg-white/[0.18] mx-auto mb-4 sm:hidden" />
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-base font-semibold text-white">Delete Account</h3>
+              <button
+                onClick={() => {
+                  setIsDeleteSheetOpen(false);
+                  setDeletePassword("");
+                  setDeleteConfirmText("");
+                  setDeleteError(null);
+                }}
+                className="text-zinc-600 hover:text-zinc-300"
+              >
+                ×
+              </button>
+            </div>
+
+            <p className="text-sm text-zinc-400 mb-4">
+              This permanently deletes your account and private brain data. This action cannot be undone.
+            </p>
+
+            {!authUser.is_guest && (
+              <div className="mb-3">
+                <p className="text-xs text-zinc-600 mb-1">Confirm password</p>
+                <input
+                  type="password"
+                  value={deletePassword}
+                  onChange={(e) => setDeletePassword(e.target.value)}
+                  className="w-full rounded-xl bg-white/[0.03] border border-white/[0.08] px-3 py-2.5 text-sm text-white"
+                  placeholder="Enter your password"
+                />
+              </div>
+            )}
+
+            {authUser.is_guest && (
+              <div className="mb-4">
+                <p className="text-xs text-zinc-600 mb-1">Type DELETE to confirm</p>
+                <input
+                  value={deleteConfirmText}
+                  onChange={(e) => setDeleteConfirmText(e.target.value)}
+                  className="w-full rounded-xl bg-white/[0.03] border border-white/[0.08] px-3 py-2.5 text-sm text-white"
+                  placeholder="DELETE"
+                />
+              </div>
+            )}
+
+            {deleteError && (
+              <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                {deleteError}
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              <button
+                onClick={() => {
+                  setIsDeleteSheetOpen(false);
+                  setDeletePassword("");
+                  setDeleteConfirmText("");
+                  setDeleteError(null);
+                }}
+                className="flex-1 py-2.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] text-zinc-300 text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={deleteAccount}
+                disabled={
+                  profileDeleting ||
+                  (!authUser.is_guest && !deletePassword.trim()) ||
+                  (authUser.is_guest && deleteConfirmText !== "DELETE")
+                }
+                className="flex-1 py-2.5 rounded-xl bg-red-600 hover:bg-red-500 disabled:opacity-40 text-white text-sm"
+              >
+                {profileDeleting ? "Deleting..." : "Delete Forever"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

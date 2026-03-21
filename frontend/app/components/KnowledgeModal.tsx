@@ -5,6 +5,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
 const DRAFT_KEY = "second-brain-direct-note-draft-v1";
 
+const getAuthHeaders = (contentType = false) => {
+  const token = typeof window !== "undefined" ? localStorage.getItem("sb_token") : null;
+  return {
+    ...(contentType ? { "Content-Type": "application/json" } : {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+};
+
 type DocumentListItem = {
   id: string;
   source: string;
@@ -35,7 +43,7 @@ export default function KnowledgeModal({ isOpen, onClose }: { isOpen: boolean, o
 
   const fetchDocs = async () => {
     try {
-      const res = await fetch(`${API_BASE_URL}/api/documents`);
+      const res = await fetch(`${API_BASE_URL}/api/documents`, { headers: getAuthHeaders() });
       if (!res.ok) {
         throw new Error(`Failed to fetch documents: ${res.status}`);
       }
@@ -52,7 +60,7 @@ export default function KnowledgeModal({ isOpen, onClose }: { isOpen: boolean, o
   const handleDelete = async (id: string) => {
     setConfirmDeleteId(null);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/documents/${id}`, { method: "DELETE" });
+      const res = await fetch(`${API_BASE_URL}/api/documents/${id}`, { method: "DELETE", headers: getAuthHeaders() });
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
         throw new Error(errorData.detail || `Failed to delete document: ${res.status}`);
@@ -72,7 +80,7 @@ export default function KnowledgeModal({ isOpen, onClose }: { isOpen: boolean, o
     try {
       const res = await fetch(`${API_BASE_URL}/api/ingest/text`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: getAuthHeaders(true),
         body: JSON.stringify({ title: newTitle, text: newText })
       });
       if (!res.ok) {

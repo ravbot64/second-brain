@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from secrets import compare_digest, token_urlsafe
 from api.router import router
 from core.config import settings
 from core.init_db import init_postgres, init_qdrant
@@ -52,6 +53,27 @@ app.include_router(router, prefix="/api")
 
 @app.on_event("startup")
 async def startup_init_datastores():
+    insecure_defaults = {"", "change-this-in-production"}
+    jwt_secret = (settings.JWT_SECRET or "").strip()
+
+    localhost_prefixes = (
+        "http://localhost",
+        "http://127.0.0.1",
+        "https://localhost",
+        "https://127.0.0.1",
+    )
+    local_origins_only = bool(settings.cors_origins_list) and all(
+        origin.startswith(localhost_prefixes) for origin in settings.cors_origins_list
+    )
+    is_local_dev = settings.DB_URL.startswith("sqlite") or local_origins_only
+
+    if any(compare_digest(jwt_secret, value) for value in insecure_defaults) or len(jwt_secret) < 32:
+        if is_local_dev:
+            settings.JWT_SECRET = token_urlsafe(48)
+            print("Startup warning: using ephemeral JWT_SECRET for local development only")
+        else:
+            raise RuntimeError("JWT_SECRET must be set to a strong secret (min 32 chars) before starting the API")
+
     # Avoid hard-failing app startup if a managed service is temporarily unreachable.
     try:
         init_postgres()
