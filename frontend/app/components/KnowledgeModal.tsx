@@ -20,6 +20,13 @@ type DocumentListItem = {
   content_snippet: string;
 };
 
+type DocumentDetail = {
+  id: string;
+  source: string;
+  title: string;
+  content: string;
+};
+
 type EditorMode = "write" | "split" | "preview";
 
 export default function KnowledgeModal({ isOpen, onClose }: { isOpen: boolean, onClose: () => void }) {
@@ -33,6 +40,9 @@ export default function KnowledgeModal({ isOpen, onClose }: { isOpen: boolean, o
   const [editorMode, setEditorMode] = useState<EditorMode>("write");
   const [saveStatus, setSaveStatus] = useState("Draft not saved yet");
   const [error, setError] = useState<string | null>(null);
+  const [expandedDocId, setExpandedDocId] = useState<string | null>(null);
+  const [loadingDocId, setLoadingDocId] = useState<string | null>(null);
+  const [docContentById, setDocContentById] = useState<Record<string, DocumentDetail>>({});
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -71,6 +81,33 @@ export default function KnowledgeModal({ isOpen, onClose }: { isOpen: boolean, o
       console.error("Failed to delete", e);
       const errorMsg = e instanceof Error ? e.message : "Failed to delete document";
       setError(errorMsg);
+    }
+  };
+
+  const togglePreview = async (id: string) => {
+    if (expandedDocId === id) {
+      setExpandedDocId(null);
+      return;
+    }
+
+    setExpandedDocId(id);
+    if (docContentById[id]) return;
+
+    setLoadingDocId(id);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/documents/${id}`, { headers: getAuthHeaders() });
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.detail || `Failed to fetch document content: ${res.status}`);
+      }
+      const detail = await res.json();
+      setDocContentById((prev) => ({ ...prev, [id]: detail }));
+      setError(null);
+    } catch (e) {
+      const errorMsg = e instanceof Error ? e.message : "Failed to load document content";
+      setError(errorMsg);
+    } finally {
+      setLoadingDocId(null);
     }
   };
 
@@ -285,13 +322,34 @@ export default function KnowledgeModal({ isOpen, onClose }: { isOpen: boolean, o
                           </div>
                           <p className="text-xs text-zinc-600 line-clamp-2 leading-relaxed">{doc.content_snippet}</p>
                         </div>
-                        <button
-                          onClick={() => setConfirmDeleteId(doc.id)}
-                          className="text-zinc-800 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all p-1.5 hover:bg-red-500/10 rounded-lg flex-shrink-0"
-                          title="Delete"
-                        >
-                          <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                        </button>
+                        <div className="flex items-center gap-1 flex-shrink-0">
+                          <button
+                            onClick={() => { void togglePreview(doc.id); }}
+                            className="text-zinc-500 hover:text-zinc-200 transition-all p-1.5 hover:bg-white/[0.06] rounded-lg"
+                            title="View content"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
+                          </button>
+                          <button
+                            onClick={() => setConfirmDeleteId(doc.id)}
+                            className="text-zinc-800 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all p-1.5 hover:bg-red-500/10 rounded-lg"
+                            title="Delete"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {expandedDocId === doc.id && (
+                      <div className="mt-3 pt-3 border-t border-white/[0.06]">
+                        {loadingDocId === doc.id ? (
+                          <p className="text-xs text-zinc-500">Loading full content...</p>
+                        ) : (
+                          <pre className="text-xs text-zinc-300 whitespace-pre-wrap break-words max-h-56 overflow-y-auto custom-scrollbar bg-white/[0.02] border border-white/[0.06] rounded-lg p-3">
+                            {docContentById[doc.id]?.content || "No content available."}
+                          </pre>
+                        )}
                       </div>
                     )}
                   </div>

@@ -582,6 +582,28 @@ def list_documents(current_user: DBUser = Depends(get_current_user)):
         db.close()
 
 
+@router.get("/documents/{doc_id}")
+def get_document(doc_id: str, current_user: DBUser = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        doc = db.query(DBDocument).filter(
+            DBDocument.id == doc_id,
+            DBDocument.user_id.in_(visible_user_ids(current_user)),
+        ).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        return {
+            "id": doc.id,
+            "source": doc.source,
+            "title": (doc.metadata_ or {}).get("title", (doc.metadata_ or {}).get("filename", "Unknown")),
+            "content": doc.content,
+            "created_at": doc.created_at,
+        }
+    finally:
+        db.close()
+
+
 @router.get("/stats")
 def get_stats(current_user: DBUser = Depends(get_current_user)):
     db = SessionLocal()
