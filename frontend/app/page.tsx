@@ -145,10 +145,17 @@ export default function Home() {
     errorTimeoutRef.current = setTimeout(() => setError(null), 5000);
   };
 
-  const authFetch = (url: string, init?: RequestInit) => {
+  const authFetch = async (url: string, init?: RequestInit) => {
     const headers = new Headers(init?.headers || {});
     if (token) headers.set("Authorization", `Bearer ${token}`);
-    return fetch(url, { ...init, headers });
+    try {
+      return await fetch(url, { ...init, headers });
+    } catch {
+      return new Response(JSON.stringify({ detail: "Network error" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
   };
 
   const persistSession = (nextToken: string, user: AuthUser) => {
@@ -236,8 +243,7 @@ export default function Home() {
       const nextCount = Array.isArray(data) ? data.length : 0;
       setDocumentCount(nextCount);
       return nextCount;
-    } catch (err) {
-      console.error("Failed to check document count:", err);
+    } catch {
       return null;
     } finally {
       if (!silent) setIsKbLoading(false);
@@ -256,6 +262,38 @@ export default function Home() {
     setIsModalOpen(false);
     checkDocumentCount();
   };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+
+      if (isDeleteSheetOpen) {
+        setIsDeleteSheetOpen(false);
+        setDeletePassword("");
+        setDeleteConfirmText("");
+        setDeleteError(null);
+        return;
+      }
+      if (isProfileOpen) {
+        setIsProfileOpen(false);
+        return;
+      }
+      if (isModalOpen) {
+        handleModalClose();
+        return;
+      }
+      if (isAboutOpen) {
+        setIsAboutOpen(false);
+        return;
+      }
+      if (confirmDeleteId) {
+        setConfirmDeleteId(null);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isDeleteSheetOpen, isProfileOpen, isModalOpen, isAboutOpen, confirmDeleteId]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -536,7 +574,16 @@ export default function Home() {
             <button onClick={() => setAuthMode("register")} className={`flex-1 py-2 text-sm rounded-lg ${authMode === "register" ? "bg-blue-600 text-white" : "text-zinc-500"}`}>Sign up</button>
           </div>
 
-          <div className="space-y-3">
+          <form
+            className="space-y-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (authLoading || !authEmail || !authPassword || (authMode === "register" && !authFullName.trim())) {
+                return;
+              }
+              submitAuth(authMode);
+            }}
+          >
             {authMode === "register" && (
               <input
                 value={authFullName}
@@ -560,7 +607,7 @@ export default function Home() {
             />
             {authError && <p className="text-xs text-red-400">{authError}</p>}
             <button
-              onClick={() => submitAuth(authMode)}
+              type="submit"
               disabled={authLoading || !authEmail || !authPassword || (authMode === "register" && !authFullName.trim())}
               className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-sm"
             >
@@ -573,7 +620,7 @@ export default function Home() {
             >
               Continue as Guest
             </button>
-          </div>
+          </form>
         </div>
       </div>
     );
@@ -1085,7 +1132,18 @@ export default function Home() {
 
       {isProfileOpen && authUser && !authUser.is_guest && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)" }}>
-          <div className="w-full max-w-md rounded-2xl border border-white/[0.08] bg-[#0e0e11]/95 p-5">
+          <div
+            className="w-full max-w-md rounded-2xl border border-white/[0.08] bg-[#0e0e11]/95 p-5"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                setIsProfileOpen(false);
+              }
+              if (e.key === "Enter" && e.target instanceof HTMLElement && e.target.tagName !== "TEXTAREA") {
+                e.preventDefault();
+                saveProfile();
+              }
+            }}
+          >
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-base font-semibold text-white">Profile</h3>
               <button onClick={() => setIsProfileOpen(false)} className="text-zinc-600 hover:text-zinc-300">×</button>
@@ -1143,7 +1201,22 @@ export default function Home() {
 
       {isDeleteSheetOpen && authUser && !authUser.is_guest && (
         <div className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center p-0 sm:p-4" style={{ background: "rgba(0,0,0,0.75)", backdropFilter: "blur(8px)" }}>
-          <div className="w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl border border-white/[0.08] bg-[#111114] p-5 sm:p-6 shadow-2xl">
+          <div
+            className="w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl border border-white/[0.08] bg-[#111114] p-5 sm:p-6 shadow-2xl"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                setIsDeleteSheetOpen(false);
+                setDeletePassword("");
+                setDeleteConfirmText("");
+                setDeleteError(null);
+              }
+              if (e.key === "Enter") {
+                if (!profileDeleting && deletePassword.trim()) {
+                  deleteAccount();
+                }
+              }
+            }}
+          >
             <div className="w-10 h-1 rounded-full bg-white/[0.18] mx-auto mb-4 sm:hidden" />
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-base font-semibold text-white">Delete Account</h3>

@@ -7,6 +7,7 @@ import os
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
+from sqlalchemy.exc import OperationalError
 
 from .config import settings
 from .database import SessionLocal
@@ -67,11 +68,19 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
-    db = SessionLocal()
-    try:
-        user = db.query(DBUser).filter(DBUser.id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-        return user
-    finally:
-        db.close()
+    for attempt in range(2):
+        db = SessionLocal()
+        try:
+            user = db.query(DBUser).filter(DBUser.id == user_id).first()
+            if not user:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+            return user
+        except OperationalError as e:
+            if attempt == 0:
+                print(f"Auth DB transient failure, retrying once: {e}")
+                continue
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database temporarily unavailable")
+        finally:
+            db.close()
+
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database temporarily unavailable")
