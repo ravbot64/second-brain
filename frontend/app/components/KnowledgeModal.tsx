@@ -113,7 +113,7 @@ export default function KnowledgeModal({ isOpen, onClose, focusDocId }: { isOpen
   const handleReindex = async () => {
     if (reindexing) return;
     setReindexing(true);
-    setReindexMsg(null);
+    setReindexMsg("Starting re-index…");
     setError(null);
     try {
       const res = await fetch(`${API_BASE_URL}/api/reindex`, { method: "POST", headers: getAuthHeaders() });
@@ -121,11 +121,33 @@ export default function KnowledgeModal({ isOpen, onClose, focusDocId }: { isOpen
       if (!res.ok) {
         throw new Error(data.detail || `Reindex failed: ${res.status}`);
       }
-      const failedNote = data.failed ? ` (${data.failed} failed)` : "";
-      setReindexMsg(`Rebuilt ${data.chunks ?? 0} chunks from ${data.documents ?? 0} document(s)${failedNote}.`);
-      await fetchDocs();
+
+      // Re-index runs in the background (throttled to respect API rate limits);
+      // poll its status until it finishes.
+      const startedAt = Date.now();
+      const MAX_MS = 10 * 60 * 1000;
+      while (Date.now() - startedAt < MAX_MS) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const s = await fetch(`${API_BASE_URL}/api/reindex/status`, { headers: getAuthHeaders() });
+        if (!s.ok) continue;
+        const st = await s.json();
+        if (st.state === "running") {
+          const across = st.documents ? ` across ${st.documents} docs` : "";
+          const failedNote = st.failed ? `, ${st.failed} failed` : "";
+          setReindexMsg(`Rebuilding… ${st.chunks ?? 0} chunks indexed${across}${failedNote}`);
+        } else if (st.state === "done") {
+          const failedNote = st.failed ? ` (${st.failed} failed)` : "";
+          setReindexMsg(`Rebuilt ${st.chunks ?? 0} chunks from ${st.documents ?? 0} document(s)${failedNote}.`);
+          await fetchDocs();
+          return;
+        } else if (st.state === "error") {
+          throw new Error(st.error || "Re-index failed");
+        }
+      }
+      setReindexMsg("Re-index is still running in the background — check back in a moment.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Reindex failed");
+      setReindexMsg(null);
     } finally {
       setReindexing(false);
     }

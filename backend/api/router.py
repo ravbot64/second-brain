@@ -884,43 +884,41 @@ def get_document(doc_id: str, current_user: DBUser = Depends(get_current_user)):
         db.close()
 
 
-@router.post("/reindex")
-def reindex(current_user: DBUser = Depends(get_current_user)):
-    """Rebuild all of the current user's vectors from the text stored in Postgres.
+# In-memory re-index progress, keyed by the account that started it. Fine for a
+# single-instance deployment; a multi-instance setup would use a shared store.
+_reindex_status: Dict[str, Dict[str, Any]] = {}
 
-    Use this to repair an index whose vectors became inconsistent (e.g. mixed
-    embedding spaces). It deletes the user's existing chunks and re-embeds every
-    document through the current embedding path, so all vectors end up in one
-    consistent space. Failures are reported per document instead of silently
-    corrupting the index.
-    """
-    if not settings.GOOGLE_API_KEY:
-        raise HTTPException(status_code=503, detail="Embedding API is not configured")
 
+def _run_reindex(status_key: str, visible_ids: List[str]) -> None:
+    """Background worker: rebuild vectors for all visible docs, honoring rate limits."""
     db = SessionLocal()
     try:
-        docs = db.query(DBDocument).filter(DBDocument.user_id == current_user.id).all()
-        if not docs:
-            return {"status": "success", "documents": 0, "chunks": 0, "failed": 0}
+        docs = db.query(DBDocument).filter(DBDocument.user_id.in_(visible_ids)).all()
+        _reindex_status[status_key] = {
+            "state": "running",
+            "documents": len(docs),
+            "chunks": 0,
+            "failed": 0,
+        }
 
-        # Remove this user's existing vectors so we don't leave stale/mismatched points.
+        if not docs:
+            _reindex_status[status_key]["state"] = "done"
+            return
+
+        # Clear existing vectors for every visible owner so nothing stale remains.
         try:
             client.delete(
                 collection_name="second_brain_chunks",
                 points_selector=qmodels.FilterSelector(
                     filter=qmodels.Filter(
-                        must=[
-                            qmodels.FieldCondition(
-                                key="user_id",
-                                match=qmodels.MatchValue(value=current_user.id),
-                            )
-                        ]
+                        must=[qmodels.FieldCondition(key="user_id", match=qmodels.MatchAny(any=visible_ids))]
                     )
                 ),
             )
         except Exception as e:
-            print(f"Reindex: failed to clear existing vectors for {current_user.id}: {e}")
-            raise HTTPException(status_code=500, detail="Failed to clear existing vectors")
+            print(f"Reindex: failed to clear existing vectors for {visible_ids}: {e}")
+            _reindex_status[status_key].update({"state": "error", "error": "Failed to clear existing vectors"})
+            return
 
         total_chunks = 0
         failed = 0
@@ -936,7 +934,8 @@ def reindex(current_user: DBUser = Depends(get_current_user)):
                         vector=embedding,
                         payload={
                             "document_id": doc.id,
-                            "user_id": current_user.id,
+                            # Preserve the document's original owner (e.g. "legacy").
+                            "user_id": doc.user_id,
                             "source": doc.source,
                             "chunk_index": i,
                             "content": text,
@@ -950,15 +949,42 @@ def reindex(current_user: DBUser = Depends(get_current_user)):
             except Exception as e:
                 failed += 1
                 print(f"Reindex: document {doc.id} failed: {e}")
+            _reindex_status[status_key].update({"chunks": total_chunks, "failed": failed})
 
-        return {
-            "status": "success" if failed == 0 else "partial",
-            "documents": len(docs),
-            "chunks": total_chunks,
-            "failed": failed,
-        }
+        _reindex_status[status_key].update(
+            {"state": "done", "chunks": total_chunks, "failed": failed}
+        )
+    except Exception as e:
+        print(f"Reindex: unexpected failure: {e}")
+        _reindex_status[status_key] = {"state": "error", "error": "Re-index failed"}
     finally:
         db.close()
+
+
+@router.post("/reindex")
+def reindex(background_tasks: BackgroundTasks, current_user: DBUser = Depends(get_current_user)):
+    """Rebuild all vectors the user can see, from the text stored in Postgres.
+
+    Repairs an index whose vectors became inconsistent (e.g. mixed embedding
+    spaces). Runs in the background because large libraries must be throttled to
+    stay under the embedding API's per-minute quota. Poll GET /reindex/status.
+    """
+    if not settings.GOOGLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Embedding API is not configured")
+
+    existing = _reindex_status.get(current_user.id)
+    if existing and existing.get("state") == "running":
+        return {"status": "processing", **existing}
+
+    visible_ids = visible_user_ids(current_user)
+    _reindex_status[current_user.id] = {"state": "running", "documents": 0, "chunks": 0, "failed": 0}
+    background_tasks.add_task(_run_reindex, current_user.id, visible_ids)
+    return {"status": "processing"}
+
+
+@router.get("/reindex/status")
+def reindex_status(current_user: DBUser = Depends(get_current_user)):
+    return _reindex_status.get(current_user.id, {"state": "idle"})
 
 
 @router.get("/stats")

@@ -1,12 +1,25 @@
 from typing import List
 import hashlib
 import math
+import re
 import time
 
 
-# Gemini embed_content accepts multiple inputs per call. Batching avoids free-tier
-# rate limits (one call per chunk was the cause of reindex failures) and is faster.
+# Gemini embed_content accepts multiple inputs per call. Batching cuts the number
+# of HTTP calls; the free tier still meters each input against a ~100 requests/min
+# quota, so we also honor the server's retry-after on 429s.
 EMBED_BATCH_SIZE = 100
+
+
+def _retry_delay_from_error(msg: str) -> float:
+    """Extract the server-suggested retry delay (seconds) from a 429 error."""
+    m = re.search(r"retry in ([\d.]+)\s*s", msg, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"retryDelay'?\s*:?\s*'?(\d+(?:\.\d+)?)s", msg)
+    if m:
+        return float(m.group(1))
+    return 0.0
 
 
 class EmbeddingService:
@@ -60,12 +73,14 @@ class EmbeddingService:
             candidates = [self._model] + [m for m in candidates if m != self._model]
         return candidates
 
-    def _embed_batch_remote(self, texts: List[str], max_attempts: int = 4) -> List[List[float]]:
+    def _embed_batch_remote(self, texts: List[str], max_attempts: int = 6) -> List[List[float]]:
         self._load()
         from google.genai import types
 
         errors = {}
         for attempt in range(max_attempts):
+            rate_limited = False
+            retry_after = 0.0
             for model_name in self._candidate_models():
                 try:
                     result = self._client.models.embed_content(
@@ -76,10 +91,18 @@ class EmbeddingService:
                     self._model = model_name
                     return [list(e.values) for e in result.embeddings]
                 except Exception as e:
-                    errors[model_name] = str(e)
-            # Back off before retrying — handles transient errors and rate limits.
+                    msg = str(e)
+                    errors[model_name] = msg
+                    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                        rate_limited = True
+                        retry_after = max(retry_after, _retry_delay_from_error(msg))
+
             if attempt < max_attempts - 1:
-                time.sleep(min(2 ** attempt, 15))
+                if rate_limited:
+                    # Wait out the per-minute quota; honor the server's hint.
+                    time.sleep(min(max(retry_after, 5.0) + 1.0, 65.0))
+                else:
+                    time.sleep(min(2 ** attempt, 15))
 
         raise RuntimeError(f"Remote embedding failed for all candidate models: {errors}")
 
