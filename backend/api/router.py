@@ -889,8 +889,44 @@ def get_document(doc_id: str, current_user: DBUser = Depends(get_current_user)):
 _reindex_status: Dict[str, Dict[str, Any]] = {}
 
 
-def _run_reindex(status_key: str, visible_ids: List[str]) -> None:
-    """Background worker: rebuild vectors for all visible docs, honoring rate limits."""
+def _doc_title(doc: DBDocument) -> str:
+    meta = doc.metadata_ or {}
+    return meta.get("title") or meta.get("filename") or doc.id
+
+
+def _doc_has_vectors(document_id: str) -> bool:
+    try:
+        result = client.count(
+            collection_name="second_brain_chunks",
+            count_filter=qmodels.Filter(
+                must=[qmodels.FieldCondition(key="document_id", match=qmodels.MatchValue(value=document_id))]
+            ),
+            exact=True,
+        )
+        return result.count > 0
+    except Exception:
+        return False
+
+
+def _delete_doc_vectors(document_id: str) -> None:
+    client.delete(
+        collection_name="second_brain_chunks",
+        points_selector=qmodels.FilterSelector(
+            filter=qmodels.Filter(
+                must=[qmodels.FieldCondition(key="document_id", match=qmodels.MatchValue(value=document_id))]
+            )
+        ),
+    )
+
+
+def _run_reindex(status_key: str, visible_ids: List[str], force: bool) -> None:
+    """Background worker: rebuild vectors for visible docs, honoring rate limits.
+
+    force=False (default): only (re)embed documents that currently have no
+    vectors — cheap retries that don't re-spend the embedding quota on docs that
+    already work. force=True: wipe and rebuild everything (use after changing the
+    chunk size or embedding model).
+    """
     db = SessionLocal()
     try:
         docs = db.query(DBDocument).filter(DBDocument.user_id.in_(visible_ids)).all()
@@ -899,31 +935,48 @@ def _run_reindex(status_key: str, visible_ids: List[str]) -> None:
             "documents": len(docs),
             "chunks": 0,
             "failed": 0,
+            "skipped": 0,
         }
 
         if not docs:
             _reindex_status[status_key]["state"] = "done"
             return
 
-        # Clear existing vectors for every visible owner so nothing stale remains.
-        try:
-            client.delete(
-                collection_name="second_brain_chunks",
-                points_selector=qmodels.FilterSelector(
-                    filter=qmodels.Filter(
-                        must=[qmodels.FieldCondition(key="user_id", match=qmodels.MatchAny(any=visible_ids))]
-                    )
-                ),
-            )
-        except Exception as e:
-            print(f"Reindex: failed to clear existing vectors for {visible_ids}: {e}")
-            _reindex_status[status_key].update({"state": "error", "error": "Failed to clear existing vectors"})
-            return
+        if force:
+            # Wipe all visible vectors up front for a clean full rebuild.
+            try:
+                client.delete(
+                    collection_name="second_brain_chunks",
+                    points_selector=qmodels.FilterSelector(
+                        filter=qmodels.Filter(
+                            must=[qmodels.FieldCondition(key="user_id", match=qmodels.MatchAny(any=visible_ids))]
+                        )
+                    ),
+                )
+            except Exception as e:
+                print(f"Reindex: failed to clear existing vectors for {visible_ids}: {e}")
+                _reindex_status[status_key].update({"state": "error", "error": "Failed to clear existing vectors"})
+                return
 
         total_chunks = 0
         failed = 0
+        skipped = 0
         for doc in docs:
+            title = _doc_title(doc)
             try:
+                # Incremental mode: leave already-indexed docs untouched.
+                if not force and _doc_has_vectors(doc.id):
+                    skipped += 1
+                    _reindex_status[status_key].update({"skipped": skipped})
+                    continue
+
+                # Remove any stray points for this doc before rebuilding it.
+                if not force:
+                    try:
+                        _delete_doc_vectors(doc.id)
+                    except Exception:
+                        pass
+
                 chunks = chunk_text(doc.content)
                 if not chunks:
                     continue
@@ -948,11 +1001,11 @@ def _run_reindex(status_key: str, visible_ids: List[str]) -> None:
                 total_chunks += len(points)
             except Exception as e:
                 failed += 1
-                print(f"Reindex: document {doc.id} failed: {e}")
-            _reindex_status[status_key].update({"chunks": total_chunks, "failed": failed})
+                print(f"Reindex: document {doc.id} ('{title}') failed: {e}")
+            _reindex_status[status_key].update({"chunks": total_chunks, "failed": failed, "skipped": skipped})
 
         _reindex_status[status_key].update(
-            {"state": "done", "chunks": total_chunks, "failed": failed}
+            {"state": "done", "chunks": total_chunks, "failed": failed, "skipped": skipped}
         )
     except Exception as e:
         print(f"Reindex: unexpected failure: {e}")
@@ -962,12 +1015,16 @@ def _run_reindex(status_key: str, visible_ids: List[str]) -> None:
 
 
 @router.post("/reindex")
-def reindex(background_tasks: BackgroundTasks, current_user: DBUser = Depends(get_current_user)):
-    """Rebuild all vectors the user can see, from the text stored in Postgres.
+def reindex(
+    background_tasks: BackgroundTasks,
+    force: bool = False,
+    current_user: DBUser = Depends(get_current_user),
+):
+    """Rebuild vectors from the text stored in Postgres. Runs in the background.
 
-    Repairs an index whose vectors became inconsistent (e.g. mixed embedding
-    spaces). Runs in the background because large libraries must be throttled to
-    stay under the embedding API's per-minute quota. Poll GET /reindex/status.
+    By default only embeds documents that are missing vectors (cheap retries that
+    respect the embedding quota). Pass ?force=true to wipe and rebuild everything
+    (use after changing chunk size or embedding model). Poll GET /reindex/status.
     """
     if not settings.GOOGLE_API_KEY:
         raise HTTPException(status_code=503, detail="Embedding API is not configured")
@@ -977,8 +1034,8 @@ def reindex(background_tasks: BackgroundTasks, current_user: DBUser = Depends(ge
         return {"status": "processing", **existing}
 
     visible_ids = visible_user_ids(current_user)
-    _reindex_status[current_user.id] = {"state": "running", "documents": 0, "chunks": 0, "failed": 0}
-    background_tasks.add_task(_run_reindex, current_user.id, visible_ids)
+    _reindex_status[current_user.id] = {"state": "running", "documents": 0, "chunks": 0, "failed": 0, "skipped": 0}
+    background_tasks.add_task(_run_reindex, current_user.id, visible_ids, force)
     return {"status": "processing"}
 
 

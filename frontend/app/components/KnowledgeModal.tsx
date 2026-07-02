@@ -133,11 +133,15 @@ export default function KnowledgeModal({ isOpen, onClose, focusDocId }: { isOpen
         const st = await s.json();
         if (st.state === "running") {
           const across = st.documents ? ` across ${st.documents} docs` : "";
+          const skippedNote = st.skipped ? `, ${st.skipped} already indexed` : "";
           const failedNote = st.failed ? `, ${st.failed} failed` : "";
-          setReindexMsg(`Rebuilding… ${st.chunks ?? 0} chunks indexed${across}${failedNote}`);
+          setReindexMsg(`Rebuilding… ${st.chunks ?? 0} chunks indexed${across}${skippedNote}${failedNote}`);
         } else if (st.state === "done") {
-          const failedNote = st.failed ? ` (${st.failed} failed)` : "";
-          setReindexMsg(`Rebuilt ${st.chunks ?? 0} chunks from ${st.documents ?? 0} document(s)${failedNote}.`);
+          const parts = [];
+          if (st.skipped) parts.push(`${st.skipped} already indexed`);
+          if (st.failed) parts.push(`${st.failed} failed`);
+          const note = parts.length ? ` (${parts.join(", ")})` : "";
+          setReindexMsg(`Rebuilt ${st.chunks ?? 0} chunks from ${st.documents ?? 0} document(s)${note}.`);
           await fetchDocs();
           return;
         } else if (st.state === "error") {
@@ -359,7 +363,7 @@ export default function KnowledgeModal({ isOpen, onClose, focusDocId }: { isOpen
                 <button
                   onClick={handleReindex}
                   disabled={reindexing || documents.length === 0}
-                  title="Rebuild the search index for all documents. Use this if answers only cite some of your files."
+                  title="Index any documents that are missing from search (skips ones already indexed). Use this if answers don't cite some of your files."
                   className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl border border-white/[0.08] bg-white/[0.03] text-xs text-zinc-300 hover:bg-white/[0.07] hover:border-white/[0.14] disabled:opacity-40 transition-colors flex-shrink-0"
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={reindexing ? "animate-spin" : ""}>
