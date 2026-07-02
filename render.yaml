@@ -37,7 +37,7 @@ services:
       - key: CORS_ALLOW_CREDENTIALS
         value: "true"
       - key: LLM_MODEL
-        value: gemini-2.5-flash
+        value: gemini-3-flash
       - key: RETRIEVAL_TOP_K
         value: "5"
       - key: CHUNK_SIZE

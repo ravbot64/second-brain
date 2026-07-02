@@ -55,7 +55,7 @@ export default function AboutModal({ isOpen, onClose }: { isOpen: boolean; onClo
                 <div className="flex-shrink-0 w-8 h-8 rounded-lg bg-cyan-600/20 border border-cyan-500/50 flex items-center justify-center text-cyan-400 font-semibold">4</div>
                 <div>
                   <h4 className="text-white font-medium">Retrieve & Answer</h4>
-                  <p className="text-sm text-[#a1a1aa]">On each query, top-k chunks are retrieved from Qdrant and passed to Gemini 2.5 for grounded answers.</p>
+                  <p className="text-sm text-[#a1a1aa]">On each query, top-k chunks are retrieved from Qdrant and passed to Gemini 3 for grounded answers.</p>
                 </div>
               </div>
               <div className="flex gap-3">
@@ -90,11 +90,11 @@ export default function AboutModal({ isOpen, onClose }: { isOpen: boolean; onClo
               </div>
               <div className="bg-[#18181b] border border-[#27272a] rounded-lg p-3">
                 <p className="text-xs text-[#a1a1aa] uppercase tracking-wide font-medium">Embedding Model</p>
-                <p className="text-white font-medium mt-1">all-MiniLM-L6-v2</p>
+                <p className="text-white font-medium mt-1">Gemini Embedding (384-dim)</p>
               </div>
               <div className="bg-[#18181b] border border-[#27272a] rounded-lg p-3">
                 <p className="text-xs text-[#a1a1aa] uppercase tracking-wide font-medium">LLM</p>
-                <p className="text-white font-medium mt-1">Gemini 2.5 Flash</p>
+                <p className="text-white font-medium mt-1">Gemini 3 Flash</p>
               </div>
             </div>
           </section>

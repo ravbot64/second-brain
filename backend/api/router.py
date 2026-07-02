@@ -31,6 +31,45 @@ SHARED_GUEST_EMAIL = "guest@secondbrain.local"
 ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".md", ".csv", ".pdf"}
 UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB streaming chunks
 
+# Chat model fallbacks: the configured model is tried first, then progressively
+# older free-tier models, so a model that is unavailable in the current
+# project/region degrades gracefully instead of dropping to raw snippets.
+LLM_FALLBACK_MODELS = ["gemini-3-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+_working_llm_model: Optional[str] = None
+
+
+def generate_llm_answer(prompt: str) -> Optional[str]:
+    """Return a grounded answer from Gemini, or None if no model produced text."""
+    global _working_llm_model
+
+    api_key = settings.GOOGLE_API_KEY
+    if not api_key:
+        return None
+
+    from google import genai
+
+    client_gen = genai.Client(api_key=api_key)
+
+    candidates = [settings.LLM_MODEL] + [m for m in LLM_FALLBACK_MODELS if m != settings.LLM_MODEL]
+    if _working_llm_model:
+        candidates = [_working_llm_model] + [m for m in candidates if m != _working_llm_model]
+
+    last_error = None
+    for model_name in candidates:
+        try:
+            response = client_gen.models.generate_content(model=model_name, contents=prompt)
+            text = (response.text or "").strip()
+            if text:
+                _working_llm_model = model_name
+                return text
+        except Exception as e:
+            last_error = e
+            continue
+
+    if last_error:
+        print(f"LLM Error (all candidate models failed): {last_error}")
+    return None
+
 
 def visible_user_ids(current_user: DBUser) -> List[str]:
     ids = [current_user.id]
@@ -459,23 +498,15 @@ def handle_chat(request: ChatRequest, current_user: DBUser = Depends(get_current
             else:
                 context = "\n\n".join([f"Source ({r['source']}):\n{r['content']}" for r in results])
 
-                api_key = settings.GOOGLE_API_KEY
-                if api_key:
-                    from google import genai
-
-                    client_gen = genai.Client(api_key=api_key)
-                    try:
-                        response = client_gen.models.generate_content(
-                            model=settings.LLM_MODEL,
-                            contents=f"You are a helpful assistant. Use the provided context to answer the user's question accurately. If the context doesn't contain the answer, say so.\n\nContext:\n{context}\n\nQuestion: {request.query}",
-                        )
-                        answer = (response.text or "").strip()
-                        if not answer:
-                            # Model returned no text (e.g. safety filter / empty candidate).
-                            answer = "Based on your notes: " + results[0]["content"]
-                    except Exception as e:
-                        print(f"LLM Error: {e}")
-                        answer = "Based on your notes: " + results[0]["content"]
+                if settings.GOOGLE_API_KEY:
+                    prompt = (
+                        "You are a helpful assistant. Use the provided context to answer the "
+                        "user's question accurately. If the context doesn't contain the answer, "
+                        f"say so.\n\nContext:\n{context}\n\nQuestion: {request.query}"
+                    )
+                    generated = generate_llm_answer(prompt)
+                    # Fall back to the top snippet if every model failed or returned empty text.
+                    answer = generated or ("Based on your notes: " + results[0]["content"])
                 else:
                     answer = f"Based on your notes, here is the most relevant snippet:\n\n\"{results[0]['content']}\""
 

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     MAX_QUERY_LENGTH: int = 5000  # characters
     CHUNK_SIZE: int = 500  # words per chunk
     CHUNK_OVERLAP: int = 50  # word overlap between chunks
-    LLM_MODEL: str = "gemini-2.5-flash"
+    LLM_MODEL: str = "gemini-3-flash"  # Free-tier workhorse; falls back automatically if unavailable
     RETRIEVAL_TOP_K: int = 5  # top K chunks to retrieve
     
     @property

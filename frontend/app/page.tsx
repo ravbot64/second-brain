@@ -856,7 +856,7 @@ export default function Home() {
             </span>
             <span className="text-sm font-medium text-zinc-300 truncate">Agentic RAG Engine</span>
             <span className="hidden sm:inline-flex text-[10px] px-2 py-0.5 rounded-full bg-white/[0.05] text-zinc-600 font-medium border border-white/[0.04]">
-              Gemini 2.5
+              Gemini 3
             </span>
           </div>
           <div className="flex items-center gap-1">
