@@ -1,13 +1,24 @@
 from typing import List
 import hashlib
 import math
+import time
+
 
 class EmbeddingService:
+    """Produces 384-dim embeddings via Google Gemini.
+
+    Consistency is critical: every vector stored in Qdrant and every query vector
+    must come from the *same* embedding space. Silently falling back to a
+    hash-based vector (a different space) corrupts retrieval, so when an API key
+    is configured we only ever use the real API and raise on failure instead of
+    poisoning the index. The local hash embedding is used only for fully offline
+    development (no API key configured).
+    """
+
     def __init__(self):
         self._client = None
         self._model = None
         self._dim = 384
-        self._remote_available = True
 
     def _load(self):
         if self._client is None:
@@ -16,11 +27,11 @@ class EmbeddingService:
             from .config import settings
             self._client = genai.Client(
                 api_key=settings.GOOGLE_API_KEY,
-                http_options=types.HttpOptions(api_version='v1')
+                http_options=types.HttpOptions(api_version="v1"),
             )
 
     def _local_fallback_embedding(self, text: str) -> List[float]:
-        # Deterministic hash-based embedding used only when remote embedding API is unavailable.
+        # Deterministic hash-based embedding. OFFLINE-DEV ONLY (no API key).
         vec = [0.0] * self._dim
         for token in text.lower().split():
             if not token:
@@ -35,7 +46,7 @@ class EmbeddingService:
             return vec
         return [v / norm for v in vec]
 
-    def _remote_embedding(self, text: str) -> List[float]:
+    def _remote_embedding(self, text: str, retries: int = 3) -> List[float]:
         self._load()
         from google.genai import types
 
@@ -46,38 +57,43 @@ class EmbeddingService:
             "models/gemini-embedding-001",
             "models/text-embedding-004",
         ]
-
-        # Reuse the first model that succeeds to avoid repeated retries.
+        # Pin the first model that succeeds so every embedding stays in one space.
         if self._model:
             candidate_models = [self._model] + [m for m in candidate_models if m != self._model]
 
         last_error = None
-        for model_name in candidate_models:
-            try:
-                result = self._client.models.embed_content(
-                    model=model_name,
-                    contents=text,
-                    config=types.EmbedContentConfig(output_dimensionality=self._dim),
-                )
-                self._model = model_name
-                return list(result.embeddings[0].values)
-            except Exception as e:
-                last_error = e
+        for attempt in range(retries):
+            for model_name in candidate_models:
+                try:
+                    result = self._client.models.embed_content(
+                        model=model_name,
+                        contents=text,
+                        config=types.EmbedContentConfig(output_dimensionality=self._dim),
+                    )
+                    self._model = model_name
+                    return list(result.embeddings[0].values)
+                except Exception as e:
+                    last_error = e
+            # Brief backoff before retrying the whole candidate list.
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
 
         raise RuntimeError(f"Remote embedding failed for all candidate models: {last_error}")
 
     def get_embedding(self, text: str) -> List[float]:
-        if not self._remote_available:
+        from .config import settings
+
+        if not settings.GOOGLE_API_KEY:
+            # No API key: offline dev mode only. This vector space is NOT
+            # compatible with real Gemini vectors — never mix the two.
             return self._local_fallback_embedding(text)
 
-        try:
-            return self._remote_embedding(text)
-        except Exception as e:
-            self._remote_available = False
-            print(f"Embedding API unavailable, using local fallback: {e}")
-            return self._local_fallback_embedding(text)
+        # With a key configured, always use the real API and fail loudly rather
+        # than silently storing an incompatible hash vector.
+        return self._remote_embedding(text)
 
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         return [self.get_embedding(t) for t in texts]
+
 
 embedder = EmbeddingService()

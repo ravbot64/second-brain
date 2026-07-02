@@ -8,6 +8,29 @@ from core.models_db import DBDocument
 from .connectors import BaseConnector
 from qdrant_client import models as qmodels
 
+
+def chunk_text(text: str) -> List[str]:
+    """Sliding-window chunking shared by ingestion and re-indexing.
+
+    Keeping this in one place guarantees re-index produces the same chunks as the
+    original ingestion.
+    """
+    from core.config import settings
+    chunk_size = settings.CHUNK_SIZE
+    overlap = settings.CHUNK_OVERLAP
+    chunks: List[str] = []
+    if not text:
+        return chunks
+
+    words = text.split()
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk_words = words[i:i + chunk_size]
+        chunks.append(" ".join(chunk_words))
+        if i + chunk_size >= len(words):
+            break
+    return chunks
+
+
 class IngestionPipeline:
     def __init__(self, connector: BaseConnector, user_id: str):
         self.connector = connector
@@ -15,21 +38,7 @@ class IngestionPipeline:
         self.db = SessionLocal()
 
     def chunk_text(self, text: str) -> List[str]:
-        """Simple sliding window chunking."""
-        from core.config import settings
-        chunk_size = settings.CHUNK_SIZE
-        overlap = settings.CHUNK_OVERLAP
-        chunks = []
-        if not text:
-            return chunks
-        
-        words = text.split()
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk_words = words[i:i + chunk_size]
-            chunks.append(" ".join(chunk_words))
-            if i + chunk_size >= len(words):
-                break
-        return chunks
+        return chunk_text(text)
 
     def process(self):
         print(f"Starting ingestion with {self.connector.__class__.__name__}")

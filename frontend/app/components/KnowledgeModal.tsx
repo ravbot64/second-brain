@@ -43,6 +43,8 @@ export default function KnowledgeModal({ isOpen, onClose, focusDocId }: { isOpen
   const [expandedDocId, setExpandedDocId] = useState<string | null>(null);
   const [loadingDocId, setLoadingDocId] = useState<string | null>(null);
   const [docContentById, setDocContentById] = useState<Record<string, DocumentDetail>>({});
+  const [reindexing, setReindexing] = useState(false);
+  const [reindexMsg, setReindexMsg] = useState<string | null>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -105,6 +107,27 @@ export default function KnowledgeModal({ isOpen, onClose, focusDocId }: { isOpen
       console.error("Failed to delete", e);
       const errorMsg = e instanceof Error ? e.message : "Failed to delete document";
       setError(errorMsg);
+    }
+  };
+
+  const handleReindex = async () => {
+    if (reindexing) return;
+    setReindexing(true);
+    setReindexMsg(null);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/reindex`, { method: "POST", headers: getAuthHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Reindex failed: ${res.status}`);
+      }
+      const failedNote = data.failed ? ` (${data.failed} failed)` : "";
+      setReindexMsg(`Rebuilt ${data.chunks ?? 0} chunks from ${data.documents ?? 0} document(s)${failedNote}.`);
+      await fetchDocs();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Reindex failed");
+    } finally {
+      setReindexing(false);
     }
   };
 
@@ -299,17 +322,35 @@ export default function KnowledgeModal({ isOpen, onClose, focusDocId }: { isOpen
         <div className="p-6 overflow-y-auto flex-1">
           {activeTab === 'list' && (
             <div className="space-y-3">
-              {/* Search */}
-              <div className="relative">
-                <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
-                <input
-                  type="text"
-                  placeholder="Search by title or content…"
-                  value={searchQuery}
-                  onChange={e => setSearchQuery(e.target.value)}
-                  className="w-full bg-white/[0.03] border border-white/[0.07] rounded-xl pl-8 pr-4 py-2.5 text-sm text-zinc-300 placeholder-zinc-700 outline-none focus:border-white/[0.15] transition-colors"
-                />
+              {/* Search + maintenance */}
+              <div className="flex items-center gap-2">
+                <div className="relative flex-1">
+                  <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                  <input
+                    type="text"
+                    placeholder="Search by title or content…"
+                    value={searchQuery}
+                    onChange={e => setSearchQuery(e.target.value)}
+                    className="w-full bg-white/[0.03] border border-white/[0.07] rounded-xl pl-8 pr-4 py-2.5 text-sm text-zinc-300 placeholder-zinc-700 outline-none focus:border-white/[0.15] transition-colors"
+                  />
+                </div>
+                <button
+                  onClick={handleReindex}
+                  disabled={reindexing || documents.length === 0}
+                  title="Rebuild the search index for all documents. Use this if answers only cite some of your files."
+                  className="flex items-center gap-1.5 px-3 py-2.5 rounded-xl border border-white/[0.08] bg-white/[0.03] text-xs text-zinc-300 hover:bg-white/[0.07] hover:border-white/[0.14] disabled:opacity-40 transition-colors flex-shrink-0"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={reindexing ? "animate-spin" : ""}>
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36" /><polyline points="21 3 21 9 15 9" />
+                  </svg>
+                  {reindexing ? "Rebuilding…" : "Rebuild index"}
+                </button>
               </div>
+              {reindexMsg && (
+                <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+                  {reindexMsg}
+                </div>
+              )}
 
               {filteredDocs.length === 0 ? (
                 <div className="text-center py-12 text-zinc-700">

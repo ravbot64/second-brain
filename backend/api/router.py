@@ -17,7 +17,7 @@ from core.config import settings
 from core.database import SessionLocal
 from core.models_db import DBDocument, DBUser, DBConversation, DBMessage
 from core.qdrant import client
-from ingestion.pipeline import IngestionPipeline
+from ingestion.pipeline import IngestionPipeline, chunk_text
 from ingestion.raw_text_connector import RawTextConnector
 from ingestion.upload_connector import UploadFileConnector
 from retrieval.retriever import retriever
@@ -878,6 +878,83 @@ def get_document(doc_id: str, current_user: DBUser = Depends(get_current_user)):
             "title": (doc.metadata_ or {}).get("title", (doc.metadata_ or {}).get("filename", "Unknown")),
             "content": doc.content,
             "created_at": doc.created_at,
+        }
+    finally:
+        db.close()
+
+
+@router.post("/reindex")
+def reindex(current_user: DBUser = Depends(get_current_user)):
+    """Rebuild all of the current user's vectors from the text stored in Postgres.
+
+    Use this to repair an index whose vectors became inconsistent (e.g. mixed
+    embedding spaces). It deletes the user's existing chunks and re-embeds every
+    document through the current embedding path, so all vectors end up in one
+    consistent space. Failures are reported per document instead of silently
+    corrupting the index.
+    """
+    if not settings.GOOGLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Embedding API is not configured")
+
+    db = SessionLocal()
+    try:
+        docs = db.query(DBDocument).filter(DBDocument.user_id == current_user.id).all()
+        if not docs:
+            return {"status": "success", "documents": 0, "chunks": 0, "failed": 0}
+
+        # Remove this user's existing vectors so we don't leave stale/mismatched points.
+        try:
+            client.delete(
+                collection_name="second_brain_chunks",
+                points_selector=qmodels.FilterSelector(
+                    filter=qmodels.Filter(
+                        must=[
+                            qmodels.FieldCondition(
+                                key="user_id",
+                                match=qmodels.MatchValue(value=current_user.id),
+                            )
+                        ]
+                    )
+                ),
+            )
+        except Exception as e:
+            print(f"Reindex: failed to clear existing vectors for {current_user.id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to clear existing vectors")
+
+        total_chunks = 0
+        failed = 0
+        for doc in docs:
+            try:
+                chunks = chunk_text(doc.content)
+                if not chunks:
+                    continue
+                embeddings = embedder.get_embeddings(chunks)
+                points = [
+                    qmodels.PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=embedding,
+                        payload={
+                            "document_id": doc.id,
+                            "user_id": current_user.id,
+                            "source": doc.source,
+                            "chunk_index": i,
+                            "content": text,
+                            **(doc.metadata_ or {}),
+                        },
+                    )
+                    for i, (text, embedding) in enumerate(zip(chunks, embeddings))
+                ]
+                client.upsert(collection_name="second_brain_chunks", points=points)
+                total_chunks += len(points)
+            except Exception as e:
+                failed += 1
+                print(f"Reindex: document {doc.id} failed: {e}")
+
+        return {
+            "status": "success" if failed == 0 else "partial",
+            "documents": len(docs),
+            "chunks": total_chunks,
+            "failed": failed,
         }
     finally:
         db.close()
