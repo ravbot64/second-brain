@@ -17,7 +17,9 @@ security = HTTPBearer(auto_error=False)
 
 
 PBKDF2_ALGO = "sha256"
-PBKDF2_ITERATIONS = 200_000
+# OWASP-recommended minimum for PBKDF2-HMAC-SHA256. Existing hashes stay valid
+# because verify_password reads the iteration count stored in each hash.
+PBKDF2_ITERATIONS = 600_000
 
 
 def hash_password(password: str) -> str:

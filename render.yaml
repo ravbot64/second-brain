@@ -1,0 +1,52 @@
+# Render blueprint for the Second Brain backend (FastAPI).
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Secrets (GOOGLE_API_KEY, JWT_SECRET, QDRANT_API_KEY, DB_URL) are intentionally
+# marked "sync: false" so they are entered in the Render dashboard and never
+# committed to source control.
+
+services:
+  - type: web
+    name: second-brain-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DB_URL
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: JWT_EXPIRE_MINUTES
+        value: "10080"
+      - key: CORS_ORIGINS
+        sync: false
+      - key: CORS_ALLOW_CREDENTIALS
+        value: "true"
+      - key: LLM_MODEL
+        value: gemini-2.5-flash
+      - key: RETRIEVAL_TOP_K
+        value: "5"
+      - key: CHUNK_SIZE
+        value: "500"
+      - key: CHUNK_OVERLAP
+        value: "50"
+      - key: MAX_FILE_SIZE
+        value: "52428800"
+      - key: MAX_CONTENT_LENGTH
+        value: "10485760"
+      - key: MAX_QUERY_LENGTH
+        value: "5000"

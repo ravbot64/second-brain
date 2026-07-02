@@ -112,6 +112,7 @@ export default function Home() {
   const [isKbLoading, setIsKbLoading] = useState(true);
   const [isKbSyncing, setIsKbSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [backendStatus, setBackendStatus] = useState<"unknown" | "waking" | "ready">("unknown");
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<"history" | "chat" | "kb">("chat");
@@ -145,17 +146,44 @@ export default function Home() {
     errorTimeoutRef.current = setTimeout(() => setError(null), 5000);
   };
 
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Retries transient cold-start failures (network errors + 502/503/504) with
+  // exponential backoff, so a free-tier backend waking up doesn't surface as an
+  // error to the user. Also drives the "waking up" banner.
+  const requestWithRetry = async (
+    url: string,
+    init?: RequestInit,
+    attempts = 4
+  ): Promise<Response> => {
+    let lastResponse: Response | null = null;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const res = await fetch(url, init);
+        lastResponse = res;
+        if ([502, 503, 504].includes(res.status) && i < attempts - 1) {
+          setBackendStatus("waking");
+          await sleep(Math.min(1500 * 2 ** i, 8000));
+          continue;
+        }
+        setBackendStatus("ready");
+        return res;
+      } catch {
+        setBackendStatus("waking");
+        if (i < attempts - 1) await sleep(Math.min(1500 * 2 ** i, 8000));
+      }
+    }
+    if (lastResponse) return lastResponse;
+    return new Response(JSON.stringify({ detail: "Network error" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
   const authFetch = async (url: string, init?: RequestInit) => {
     const headers = new Headers(init?.headers || {});
     if (token) headers.set("Authorization", `Bearer ${token}`);
-    try {
-      return await fetch(url, { ...init, headers });
-    } catch {
-      return new Response(JSON.stringify({ detail: "Network error" }), {
-        status: 503,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+    return requestWithRetry(url, { ...init, headers });
   };
 
   const persistSession = (nextToken: string, user: AuthUser) => {
@@ -173,6 +201,37 @@ export default function Home() {
     localStorage.removeItem("sb_user");
     ensureConversation();
   };
+
+  // Warm up the (free-tier) backend as soon as the app loads so it is likely
+  // awake by the time the user signs in. Shows a banner while it spins up.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      for (let i = 0; i < 24 && !cancelled; i++) {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 8000);
+          const res = await fetch(`${API_BASE_URL}/`, {
+            signal: controller.signal,
+            cache: "no-store",
+          });
+          clearTimeout(timeout);
+          if (res.ok) {
+            if (!cancelled) setBackendStatus("ready");
+            return;
+          }
+        } catch {
+          /* server likely cold-starting; keep probing */
+        }
+        if (!cancelled) setBackendStatus("waking");
+        await sleep(2500);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const storedToken = localStorage.getItem("sb_token");
@@ -462,7 +521,7 @@ export default function Home() {
     setAuthError(null);
     setAuthLoading(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/auth/${mode}`, {
+      const res = await requestWithRetry(`${API_BASE_URL}/api/auth/${mode}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -490,7 +549,7 @@ export default function Home() {
     setAuthError(null);
     setAuthLoading(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/auth/guest`, { method: "POST" });
+      const res = await requestWithRetry(`${API_BASE_URL}/api/auth/guest`, { method: "POST" });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || "Guest login failed");
       persistSession(data.access_token, data.user);
@@ -562,10 +621,22 @@ export default function Home() {
     }
   };
 
+  const wakingBanner =
+    backendStatus === "waking" ? (
+      <div className="flex items-center gap-2.5 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3.5 py-2.5 text-[13px] text-amber-200">
+        <span className="relative flex h-2 w-2 flex-shrink-0">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-70" />
+          <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500" />
+        </span>
+        <span className="leading-snug">Waking up the server (free tier) — the first request can take up to a minute.</span>
+      </div>
+    ) : null;
+
   if (!authUser) {
     return (
       <div className="min-h-dvh bg-[#08080a] bg-grid flex items-center justify-center p-4">
         <div className="w-full max-w-md rounded-2xl border border-white/[0.08] bg-[#0e0e11]/95 p-6">
+          {wakingBanner && <div className="mb-4">{wakingBanner}</div>}
           <h2 className="text-xl font-semibold text-white mb-1">Welcome to Second Brain</h2>
           <p className="text-sm text-zinc-500 mb-6">Sign in to access your personal brain, or continue as guest.</p>
 
@@ -730,6 +801,10 @@ export default function Home() {
 
       {/* ── Main ── */}
       <main className={`${mobileView === "chat" ? "flex" : "hidden"} lg:flex flex-1 flex-col relative overflow-hidden`}>
+        {/* Backend cold-start banner */}
+        {wakingBanner && (
+          <div className="relative z-20 px-3 sm:px-4 md:px-8 pt-3">{wakingBanner}</div>
+        )}
         {/* Error toast */}
         {error && (
           <div className="fixed top-4 right-4 z-50 max-w-sm bg-red-950/95 border border-red-800/50 rounded-xl px-4 py-3 text-red-200 text-sm shadow-2xl toast-animate">

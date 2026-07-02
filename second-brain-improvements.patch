@@ -1,0 +1,609 @@
+diff --git a/.github/workflows/keep-alive.yml b/.github/workflows/keep-alive.yml
+new file mode 100644
+index 0000000..dedc4ae
+--- /dev/null
++++ b/.github/workflows/keep-alive.yml
+@@ -0,0 +1,49 @@
++name: Keep backend awake
++
++# Render's free tier spins the backend down after ~15 minutes of inactivity,
++# which causes a slow (~50s) cold start on the next request. This workflow pings
++# the health endpoint every 10 minutes to keep it warm.
++#
++# Setup: add a repository variable named BACKEND_URL pointing at the deployed API
++# root, e.g. https://your-service.onrender.com
++# (Settings -> Secrets and variables -> Actions -> Variables -> New variable)
++
++on:
++  schedule:
++    - cron: "*/10 * * * *"
++  workflow_dispatch: {}
++
++permissions:
++  contents: read
++
++concurrency:
++  group: keep-alive
++  cancel-in-progress: true
++
++jobs:
++  ping:
++    runs-on: ubuntu-latest
++    timeout-minutes: 5
++    steps:
++      - name: Ping health endpoint
++        env:
++          BACKEND_URL: ${{ vars.BACKEND_URL }}
++        run: |
++          if [ -z "${BACKEND_URL}" ]; then
++            echo "BACKEND_URL repository variable is not set; skipping."
++            exit 0
++          fi
++          url="${BACKEND_URL%/}/"
++          echo "Pinging ${url}"
++          # Retry a few times to cover the cold-start window.
++          for attempt in 1 2 3 4 5 6; do
++            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 "${url}" || echo 000)"
++            echo "Attempt ${attempt}: HTTP ${code}"
++            if [ "${code}" = "200" ]; then
++              echo "Backend is awake."
++              exit 0
++            fi
++            sleep 15
++          done
++          echo "Backend did not return 200 in time." >&2
++          exit 1
+diff --git a/README.md b/README.md
+index c75f1cd..5ca89a8 100644
+--- a/README.md
++++ b/README.md
+@@ -47,3 +47,34 @@ npm run dev
+ ```bash
+ NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
+ ```
++
++## Deployment
++
++- Frontend: Vercel (set `NEXT_PUBLIC_API_BASE_URL` to the deployed backend URL).
++- Backend: Render. A `render.yaml` blueprint is included; secrets (`DB_URL`,
++  `QDRANT_URL`, `QDRANT_API_KEY`, `GOOGLE_API_KEY`, `CORS_ORIGINS`) are set in the
++  Render dashboard and never committed. `JWT_SECRET` is auto-generated.
++
++### Cold starts (free tier)
++
++Render's free tier spins the backend down after ~15 minutes of inactivity, so the
++first request can take up to a minute. This repo mitigates that in two ways:
++
++1. Frontend warmup + retry: the app pings the backend on load, shows a
++   "waking up the server" banner, and automatically retries transient
++   `502/503/504`/network errors with backoff so cold starts don't surface as errors.
++2. Keep-alive workflow: `.github/workflows/keep-alive.yml` pings the health
++   endpoint every 10 minutes. Add a repository variable `BACKEND_URL`
++   (Settings → Secrets and variables → Actions → Variables) pointing at the API
++   root, e.g. `https://your-service.onrender.com`.
++
++## Security notes
++
++- Passwords hashed with PBKDF2-HMAC-SHA256 (600k iterations); existing hashes stay valid.
++- Strict CORS (explicit origins, methods, headers), security headers (HSTS, CSP,
++  `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`), and per-endpoint
++  rate limiting (stricter budget on `/api/auth/*`).
++- Uploads are restricted to `.txt/.md/.csv/.pdf` (plus sniffed plain text) and size
++  is enforced while streaming to disk.
++- `JWT_SECRET` must be a strong secret (≥32 chars) in production or the API refuses
++  to start.
+diff --git a/backend/api/router.py b/backend/api/router.py
+index 4d41cc9..bbc6258 100644
+--- a/backend/api/router.py
++++ b/backend/api/router.py
+@@ -1,6 +1,5 @@
+ from pathlib import Path
+ import os
+-import shutil
+ import uuid
+ from datetime import datetime, timedelta, timezone
+ from typing import Any, Dict, List, Optional
+@@ -27,6 +26,11 @@ GUEST_RETENTION_HOURS = 24
+ SHARED_GUEST_USER_ID = "guest-shared"
+ SHARED_GUEST_EMAIL = "guest@secondbrain.local"
+ 
++# Allow-list of accepted upload types. Extension-less files are permitted because
++# the connector sniffs them for printable text and rejects binary content.
++ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".md", ".csv", ".pdf"}
++UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB streaming chunks
++
+ 
+ def visible_user_ids(current_user: DBUser) -> List[str]:
+     ids = [current_user.id]
+@@ -465,7 +469,10 @@ def handle_chat(request: ChatRequest, current_user: DBUser = Depends(get_current
+                             model=settings.LLM_MODEL,
+                             contents=f"You are a helpful assistant. Use the provided context to answer the user's question accurately. If the context doesn't contain the answer, say so.\n\nContext:\n{context}\n\nQuestion: {request.query}",
+                         )
+-                        answer = response.text
++                        answer = (response.text or "").strip()
++                        if not answer:
++                            # Model returned no text (e.g. safety filter / empty candidate).
++                            answer = "Based on your notes: " + results[0]["content"]
+                     except Exception as e:
+                         print(f"LLM Error: {e}")
+                         answer = "Based on your notes: " + results[0]["content"]
+@@ -516,12 +523,47 @@ async def upload_file(
+     if not safe_name:
+         raise HTTPException(status_code=400, detail="Invalid file name")
+ 
+-    if file.size and file.size > settings.MAX_FILE_SIZE:
+-        raise HTTPException(status_code=413, detail=f"File size exceeds {settings.MAX_FILE_SIZE / 1024 / 1024:.0f}MB limit")
++    ext = Path(safe_name).suffix.lower()
++    if ext and ext not in ALLOWED_UPLOAD_EXTENSIONS:
++        raise HTTPException(
++            status_code=415,
++            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))} or plain text.",
++        )
++
++    # Enforce the size limit while streaming to disk. file.size is advisory and can
++    # be None, so we count bytes ourselves and abort early to avoid filling the disk.
++    max_size = settings.MAX_FILE_SIZE
++    if file.size is not None and file.size > max_size:
++        raise HTTPException(status_code=413, detail=f"File size exceeds {max_size / 1024 / 1024:.0f}MB limit")
+ 
+     temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{safe_name}")
+-    with open(temp_path, "wb") as buffer:
+-        shutil.copyfileobj(file.file, buffer)
++    bytes_written = 0
++    try:
++        with open(temp_path, "wb") as buffer:
++            while True:
++                chunk = await file.read(UPLOAD_CHUNK_SIZE)
++                if not chunk:
++                    break
++                bytes_written += len(chunk)
++                if bytes_written > max_size:
++                    raise HTTPException(
++                        status_code=413,
++                        detail=f"File size exceeds {max_size / 1024 / 1024:.0f}MB limit",
++                    )
++                buffer.write(chunk)
++    except HTTPException:
++        if os.path.exists(temp_path):
++            os.remove(temp_path)
++        raise
++    except Exception:
++        if os.path.exists(temp_path):
++            os.remove(temp_path)
++        raise HTTPException(status_code=400, detail="Failed to read uploaded file")
++
++    if bytes_written == 0:
++        if os.path.exists(temp_path):
++            os.remove(temp_path)
++        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+ 
+     user_id = current_user.id
+ 
+diff --git a/backend/core/auth.py b/backend/core/auth.py
+index 3a1cd1c..7bea324 100644
+--- a/backend/core/auth.py
++++ b/backend/core/auth.py
+@@ -17,7 +17,9 @@ security = HTTPBearer(auto_error=False)
+ 
+ 
+ PBKDF2_ALGO = "sha256"
+-PBKDF2_ITERATIONS = 200_000
++# OWASP-recommended minimum for PBKDF2-HMAC-SHA256. Existing hashes stay valid
++# because verify_password reads the iteration count stored in each hash.
++PBKDF2_ITERATIONS = 600_000
+ 
+ 
+ def hash_password(password: str) -> str:
+diff --git a/backend/main.py b/backend/main.py
+index b75afd7..acee018 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -1,59 +1,20 @@
+-from fastapi import FastAPI
++from contextlib import asynccontextmanager
++from collections import defaultdict
++from datetime import datetime, timedelta
++from secrets import compare_digest, token_urlsafe
++
++from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import JSONResponse
+-from secrets import compare_digest, token_urlsafe
++
+ from api.router import router
+ from core.config import settings
+ from core.init_db import init_postgres, init_qdrant
+ 
+-app = FastAPI(title="Second Brain API", version="1.0.0")
+-
+-app.add_middleware(
+-    CORSMiddleware,
+-    allow_origins=settings.cors_origins_list,
+-    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
+-    allow_methods=["*"],
+-    allow_headers=["*"],
+-)
+-
+-# Simple rate limiting: track requests per IP
+-from collections import defaultdict
+-from datetime import datetime, timedelta
+-
+-request_tracker = defaultdict(list)
+-
+-@app.middleware("http")
+-async def rate_limit_middleware(request, call_next):
+-    client_ip = request.client.host if request.client else "unknown"
+-    now = datetime.now()
+-    cutoff = now - timedelta(minutes=1)
+-    
+-    # Clean old request timestamps for this IP
+-    request_tracker[client_ip] = [t for t in request_tracker[client_ip] if t > cutoff]
+-    
+-    # Check rate limit: max 60 requests per minute per IP
+-    if len(request_tracker[client_ip]) >= 60:
+-        return JSONResponse(
+-            status_code=429,
+-            content={"detail": "Rate limit exceeded: 60 requests per minute"}
+-        )
+-    
+-    request_tracker[client_ip].append(now)
+-
+-    # Periodically evict stale IPs to prevent unbounded dict growth
+-    if len(request_tracker) > 5000:
+-        stale = [ip for ip, times in list(request_tracker.items()) if not times]
+-        for ip in stale:
+-            request_tracker.pop(ip, None)
+-    
+-    response = await call_next(request)
+-    return response
+-
+-app.include_router(router, prefix="/api")
+ 
+-@app.on_event("startup")
+-async def startup_init_datastores():
+-    insecure_defaults = {"", "change-this-in-production"}
++def _ensure_jwt_secret() -> None:
++    """Fail fast in production if a strong JWT secret is not configured."""
++    insecure_defaults = {"", "change-this-in-production", "replace_with_a_long_random_secret_min_32_chars"}
+     jwt_secret = (settings.JWT_SECRET or "").strip()
+ 
+     localhost_prefixes = (
+@@ -72,9 +33,17 @@ async def startup_init_datastores():
+             settings.JWT_SECRET = token_urlsafe(48)
+             print("Startup warning: using ephemeral JWT_SECRET for local development only")
+         else:
+-            raise RuntimeError("JWT_SECRET must be set to a strong secret (min 32 chars) before starting the API")
++            raise RuntimeError(
++                "JWT_SECRET must be set to a strong secret (min 32 chars) before starting the API"
++            )
++
+ 
+-    # Avoid hard-failing app startup if a managed service is temporarily unreachable.
++@asynccontextmanager
++async def lifespan(app: FastAPI):
++    _ensure_jwt_secret()
++
++    # Avoid hard-failing app startup if a managed service is temporarily unreachable
++    # (e.g. free-tier cold starts). Endpoints degrade gracefully instead.
+     try:
+         init_postgres()
+     except Exception as e:
+@@ -85,10 +54,105 @@ async def startup_init_datastores():
+     except Exception as e:
+         print(f"Startup warning: Qdrant init failed: {e}")
+ 
++    yield
++
++
++app = FastAPI(title="Second Brain API", version="1.1.0", lifespan=lifespan)
++
++# CORS is restricted to explicit origins and the methods/headers this API actually uses.
++# Wildcards are avoided because credentials are allowed.
++app.add_middleware(
++    CORSMiddleware,
++    allow_origins=settings.cors_origins_list,
++    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
++    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
++    allow_headers=["Authorization", "Content-Type"],
++    max_age=600,
++)
++
++
++# ── Rate limiting ─────────────────────────────────────────────────────────────
++# In-memory sliding-window limiter. Auth endpoints get a much stricter budget to
++# slow credential-stuffing/brute-force attempts.
++GENERAL_LIMIT_PER_MIN = 120
++AUTH_LIMIT_PER_MIN = 15
++
++request_tracker: defaultdict = defaultdict(list)
++auth_tracker: defaultdict = defaultdict(list)
++
++
++def _is_auth_path(path: str) -> bool:
++    return path.startswith("/api/auth/")
++
++
++@app.middleware("http")
++async def rate_limit_middleware(request: Request, call_next):
++    client_ip = request.client.host if request.client else "unknown"
++    now = datetime.now()
++    cutoff = now - timedelta(minutes=1)
++
++    tracker = auth_tracker if _is_auth_path(request.url.path) else request_tracker
++    limit = AUTH_LIMIT_PER_MIN if _is_auth_path(request.url.path) else GENERAL_LIMIT_PER_MIN
++
++    tracker[client_ip] = [t for t in tracker[client_ip] if t > cutoff]
++
++    if len(tracker[client_ip]) >= limit:
++        return JSONResponse(
++            status_code=429,
++            content={"detail": f"Rate limit exceeded: {limit} requests per minute"},
++            headers={"Retry-After": "60"},
++        )
++
++    tracker[client_ip].append(now)
++
++    # Periodically evict stale IPs to prevent unbounded dict growth.
++    for store in (request_tracker, auth_tracker):
++        if len(store) > 5000:
++            for ip in [ip for ip, times in list(store.items()) if not times]:
++                store.pop(ip, None)
++
++    return await call_next(request)
++
++
++@app.middleware("http")
++async def security_headers_middleware(request: Request, call_next):
++    response = await call_next(request)
++
++    # Defense-in-depth headers. This is a JSON API (no HTML rendered), so a strict
++    # deny-all CSP is safe and blocks any accidental content sniffing/framing.
++    response.headers.setdefault("X-Content-Type-Options", "nosniff")
++    response.headers.setdefault("X-Frame-Options", "DENY")
++    response.headers.setdefault("Referrer-Policy", "no-referrer")
++    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
++    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")
++    response.headers.setdefault(
++        "Content-Security-Policy",
++        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
++    )
++    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
++
++    # HSTS only when the request reached us over HTTPS (Render terminates TLS and
++    # forwards the original scheme via X-Forwarded-Proto).
++    forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
++    if forwarded_proto == "https":
++        response.headers.setdefault(
++            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
++        )
++
++    return response
++
++
++app.include_router(router, prefix="/api")
++
++
+ @app.get("/")
+ def read_root():
++    # Lightweight health/warmup endpoint (no datastore calls) used by uptime
++    # pingers and the frontend warmup probe to avoid free-tier cold-start stalls.
+     return {"status": "healthy", "service": "Second Brain"}
+ 
++
+ if __name__ == "__main__":
+     import uvicorn
++
+     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+diff --git a/frontend/app/page.tsx b/frontend/app/page.tsx
+index 8c9260a..058a3ce 100644
+--- a/frontend/app/page.tsx
++++ b/frontend/app/page.tsx
+@@ -112,6 +112,7 @@ export default function Home() {
+   const [isKbLoading, setIsKbLoading] = useState(true);
+   const [isKbSyncing, setIsKbSyncing] = useState(false);
+   const [error, setError] = useState<string | null>(null);
++  const [backendStatus, setBackendStatus] = useState<"unknown" | "waking" | "ready">("unknown");
+   const [copiedId, setCopiedId] = useState<string | null>(null);
+   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+   const [mobileView, setMobileView] = useState<"history" | "chat" | "kb">("chat");
+@@ -145,17 +146,44 @@ export default function Home() {
+     errorTimeoutRef.current = setTimeout(() => setError(null), 5000);
+   };
+ 
++  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
++
++  // Retries transient cold-start failures (network errors + 502/503/504) with
++  // exponential backoff, so a free-tier backend waking up doesn't surface as an
++  // error to the user. Also drives the "waking up" banner.
++  const requestWithRetry = async (
++    url: string,
++    init?: RequestInit,
++    attempts = 4
++  ): Promise<Response> => {
++    let lastResponse: Response | null = null;
++    for (let i = 0; i < attempts; i++) {
++      try {
++        const res = await fetch(url, init);
++        lastResponse = res;
++        if ([502, 503, 504].includes(res.status) && i < attempts - 1) {
++          setBackendStatus("waking");
++          await sleep(Math.min(1500 * 2 ** i, 8000));
++          continue;
++        }
++        setBackendStatus("ready");
++        return res;
++      } catch {
++        setBackendStatus("waking");
++        if (i < attempts - 1) await sleep(Math.min(1500 * 2 ** i, 8000));
++      }
++    }
++    if (lastResponse) return lastResponse;
++    return new Response(JSON.stringify({ detail: "Network error" }), {
++      status: 503,
++      headers: { "Content-Type": "application/json" },
++    });
++  };
++
+   const authFetch = async (url: string, init?: RequestInit) => {
+     const headers = new Headers(init?.headers || {});
+     if (token) headers.set("Authorization", `Bearer ${token}`);
+-    try {
+-      return await fetch(url, { ...init, headers });
+-    } catch {
+-      return new Response(JSON.stringify({ detail: "Network error" }), {
+-        status: 503,
+-        headers: { "Content-Type": "application/json" },
+-      });
+-    }
++    return requestWithRetry(url, { ...init, headers });
+   };
+ 
+   const persistSession = (nextToken: string, user: AuthUser) => {
+@@ -174,6 +202,37 @@ export default function Home() {
+     ensureConversation();
+   };
+ 
++  // Warm up the (free-tier) backend as soon as the app loads so it is likely
++  // awake by the time the user signs in. Shows a banner while it spins up.
++  useEffect(() => {
++    let cancelled = false;
++    (async () => {
++      for (let i = 0; i < 24 && !cancelled; i++) {
++        try {
++          const controller = new AbortController();
++          const timeout = setTimeout(() => controller.abort(), 8000);
++          const res = await fetch(`${API_BASE_URL}/`, {
++            signal: controller.signal,
++            cache: "no-store",
++          });
++          clearTimeout(timeout);
++          if (res.ok) {
++            if (!cancelled) setBackendStatus("ready");
++            return;
++          }
++        } catch {
++          /* server likely cold-starting; keep probing */
++        }
++        if (!cancelled) setBackendStatus("waking");
++        await sleep(2500);
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
+   useEffect(() => {
+     const storedToken = localStorage.getItem("sb_token");
+     const storedUser = localStorage.getItem("sb_user");
+@@ -462,7 +521,7 @@ export default function Home() {
+     setAuthError(null);
+     setAuthLoading(true);
+     try {
+-      const res = await fetch(`${API_BASE_URL}/api/auth/${mode}`, {
++      const res = await requestWithRetry(`${API_BASE_URL}/api/auth/${mode}`, {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({
+@@ -490,7 +549,7 @@ export default function Home() {
+     setAuthError(null);
+     setAuthLoading(true);
+     try {
+-      const res = await fetch(`${API_BASE_URL}/api/auth/guest`, { method: "POST" });
++      const res = await requestWithRetry(`${API_BASE_URL}/api/auth/guest`, { method: "POST" });
+       const data = await res.json().catch(() => ({}));
+       if (!res.ok) throw new Error(data.detail || "Guest login failed");
+       persistSession(data.access_token, data.user);
+@@ -562,10 +621,22 @@ export default function Home() {
+     }
+   };
+ 
++  const wakingBanner =
++    backendStatus === "waking" ? (
++      <div className="flex items-center gap-2.5 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3.5 py-2.5 text-[13px] text-amber-200">
++        <span className="relative flex h-2 w-2 flex-shrink-0">
++          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-70" />
++          <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500" />
++        </span>
++        <span className="leading-snug">Waking up the server (free tier) — the first request can take up to a minute.</span>
++      </div>
++    ) : null;
++
+   if (!authUser) {
+     return (
+       <div className="min-h-dvh bg-[#08080a] bg-grid flex items-center justify-center p-4">
+         <div className="w-full max-w-md rounded-2xl border border-white/[0.08] bg-[#0e0e11]/95 p-6">
++          {wakingBanner && <div className="mb-4">{wakingBanner}</div>}
+           <h2 className="text-xl font-semibold text-white mb-1">Welcome to Second Brain</h2>
+           <p className="text-sm text-zinc-500 mb-6">Sign in to access your personal brain, or continue as guest.</p>
+ 
+@@ -730,6 +801,10 @@ export default function Home() {
+ 
+       {/* ── Main ── */}
+       <main className={`${mobileView === "chat" ? "flex" : "hidden"} lg:flex flex-1 flex-col relative overflow-hidden`}>
++        {/* Backend cold-start banner */}
++        {wakingBanner && (
++          <div className="relative z-20 px-3 sm:px-4 md:px-8 pt-3">{wakingBanner}</div>
++        )}
+         {/* Error toast */}
+         {error && (
+           <div className="fixed top-4 right-4 z-50 max-w-sm bg-red-950/95 border border-red-800/50 rounded-xl px-4 py-3 text-red-200 text-sm shadow-2xl toast-animate">
+diff --git a/render.yaml b/render.yaml
+new file mode 100644
+index 0000000..17768ae
+--- /dev/null
++++ b/render.yaml
+@@ -0,0 +1,52 @@
++# Render blueprint for the Second Brain backend (FastAPI).
++# Docs: https://render.com/docs/blueprint-spec
++#
++# Secrets (GOOGLE_API_KEY, JWT_SECRET, QDRANT_API_KEY, DB_URL) are intentionally
++# marked "sync: false" so they are entered in the Render dashboard and never
++# committed to source control.
++
++services:
++  - type: web
++    name: second-brain-api
++    runtime: python
++    plan: free
++    rootDir: backend
++    buildCommand: pip install -r requirements.txt
++    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
++    healthCheckPath: /
++    autoDeploy: true
++    envVars:
++      - key: PYTHON_VERSION
++        value: "3.11.9"
++      - key: DB_URL
++        sync: false
++      - key: QDRANT_URL
++        sync: false
++      - key: QDRANT_API_KEY
++        sync: false
++      - key: GOOGLE_API_KEY
++        sync: false
++      - key: JWT_SECRET
++        generateValue: true
++      - key: JWT_ALGORITHM
++        value: HS256
++      - key: JWT_EXPIRE_MINUTES
++        value: "10080"
++      - key: CORS_ORIGINS
++        sync: false
++      - key: CORS_ALLOW_CREDENTIALS
++        value: "true"
++      - key: LLM_MODEL
++        value: gemini-2.5-flash
++      - key: RETRIEVAL_TOP_K
++        value: "5"
++      - key: CHUNK_SIZE
++        value: "500"
++      - key: CHUNK_OVERLAP
++        value: "50"
++      - key: MAX_FILE_SIZE
++        value: "52428800"
++      - key: MAX_CONTENT_LENGTH
++        value: "10485760"
++      - key: MAX_QUERY_LENGTH
++        value: "5000"

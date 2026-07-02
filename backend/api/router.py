@@ -1,6 +1,5 @@
 from pathlib import Path
 import os
-import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -26,6 +25,11 @@ LEGACY_USER_ID = "legacy"
 GUEST_RETENTION_HOURS = 24
 SHARED_GUEST_USER_ID = "guest-shared"
 SHARED_GUEST_EMAIL = "guest@secondbrain.local"
+
+# Allow-list of accepted upload types. Extension-less files are permitted because
+# the connector sniffs them for printable text and rejects binary content.
+ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".md", ".csv", ".pdf"}
+UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB streaming chunks
 
 
 def visible_user_ids(current_user: DBUser) -> List[str]:
@@ -465,7 +469,10 @@ def handle_chat(request: ChatRequest, current_user: DBUser = Depends(get_current
                             model=settings.LLM_MODEL,
                             contents=f"You are a helpful assistant. Use the provided context to answer the user's question accurately. If the context doesn't contain the answer, say so.\n\nContext:\n{context}\n\nQuestion: {request.query}",
                         )
-                        answer = response.text
+                        answer = (response.text or "").strip()
+                        if not answer:
+                            # Model returned no text (e.g. safety filter / empty candidate).
+                            answer = "Based on your notes: " + results[0]["content"]
                     except Exception as e:
                         print(f"LLM Error: {e}")
                         answer = "Based on your notes: " + results[0]["content"]
@@ -516,12 +523,47 @@ async def upload_file(
     if not safe_name:
         raise HTTPException(status_code=400, detail="Invalid file name")
 
-    if file.size and file.size > settings.MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail=f"File size exceeds {settings.MAX_FILE_SIZE / 1024 / 1024:.0f}MB limit")
+    ext = Path(safe_name).suffix.lower()
+    if ext and ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))} or plain text.",
+        )
+
+    # Enforce the size limit while streaming to disk. file.size is advisory and can
+    # be None, so we count bytes ourselves and abort early to avoid filling the disk.
+    max_size = settings.MAX_FILE_SIZE
+    if file.size is not None and file.size > max_size:
+        raise HTTPException(status_code=413, detail=f"File size exceeds {max_size / 1024 / 1024:.0f}MB limit")
 
     temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{safe_name}")
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    bytes_written = 0
+    try:
+        with open(temp_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > max_size:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File size exceeds {max_size / 1024 / 1024:.0f}MB limit",
+                    )
+                buffer.write(chunk)
+    except HTTPException:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise HTTPException(status_code=400, detail="Failed to read uploaded file")
+
+    if bytes_written == 0:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     user_id = current_user.id
 
