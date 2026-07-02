@@ -15,6 +15,7 @@ import re
 from core.auth import create_access_token, get_current_user, hash_password, verify_password
 from core.config import settings
 from core.database import SessionLocal
+from core.embeddings import embedder
 from core.models_db import DBDocument, DBUser, DBConversation, DBMessage
 from core.qdrant import client
 from ingestion.pipeline import IngestionPipeline, chunk_text
