@@ -29,7 +29,7 @@ type DocumentDetail = {
 
 type EditorMode = "write" | "split" | "preview";
 
-export default function KnowledgeModal({ isOpen, onClose }: { isOpen: boolean, onClose: () => void }) {
+export default function KnowledgeModal({ isOpen, onClose, focusDocId }: { isOpen: boolean, onClose: () => void, focusDocId?: string | null }) {
   const [activeTab, setActiveTab] = useState("list");
   const [documents, setDocuments] = useState<DocumentListItem[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -50,6 +50,30 @@ export default function KnowledgeModal({ isOpen, onClose }: { isOpen: boolean, o
       fetchDocs();
     }
   }, [isOpen, activeTab]);
+
+  // When opened from a chat citation, jump to the list and expand that document.
+  useEffect(() => {
+    if (!isOpen || !focusDocId) return;
+    setActiveTab("list");
+    setExpandedDocId(focusDocId);
+    if (docContentById[focusDocId]) return;
+
+    (async () => {
+      setLoadingDocId(focusDocId);
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/documents/${focusDocId}`, { headers: getAuthHeaders() });
+        if (res.ok) {
+          const detail = await res.json();
+          setDocContentById((prev) => ({ ...prev, [focusDocId]: detail }));
+        }
+      } catch {
+        /* non-fatal; the preview simply won't pre-load */
+      } finally {
+        setLoadingDocId(null);
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, focusDocId]);
 
   const fetchDocs = async () => {
     try {

@@ -3,14 +3,26 @@
 import { useState, useRef, useEffect } from "react";
 import KnowledgeModal from "./components/KnowledgeModal";
 import AboutModal from "./components/AboutModal";
+import Markdown from "./components/Markdown";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+
+type Source = { score?: number; source?: string; title?: string; document_id?: string };
+
+type StreamEvent = {
+  type: "meta" | "delta" | "done" | "error";
+  text?: string;
+  sources?: Source[];
+  conversation_id?: string;
+  conversation_title?: string;
+  detail?: string;
+};
 
 type Message = {
   id: string;
   role: string;
   content: string;
-  sources?: { score: number; source?: string }[];
+  sources?: Source[];
   timestamp: Date;
 };
 
@@ -70,7 +82,7 @@ export default function Home() {
       id: string;
       role: string;
       content: string;
-      sources?: { score: number; source?: string }[];
+      sources?: Source[];
       timestamp?: string;
     }>;
   }): Conversation => ({
@@ -106,6 +118,8 @@ export default function Home() {
 
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [streamingId, setStreamingId] = useState<string | null>(null);
+  const [citationDocId, setCitationDocId] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isAboutOpen, setIsAboutOpen] = useState(false);
   const [documentCount, setDocumentCount] = useState(0);
@@ -230,7 +244,6 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -319,6 +332,7 @@ export default function Home() {
 
   const handleModalClose = () => {
     setIsModalOpen(false);
+    setCitationDocId(null);
     checkDocumentCount();
   };
 
@@ -462,7 +476,28 @@ export default function Home() {
     );
     setInput("");
     setIsLoading(true);
-    try {
+
+    // Placeholder assistant bubble that fills in as tokens stream.
+    const assistantId = crypto.randomUUID();
+    pushMessage(currentId, {
+      id: assistantId,
+      role: "assistant",
+      content: "",
+      sources: [],
+      timestamp: new Date(),
+    });
+    setStreamingId(assistantId);
+
+    const updateAssistant = (updater: (m: Message) => Message) =>
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id !== currentId
+            ? c
+            : { ...c, messages: c.messages.map((m) => (m.id === assistantId ? updater(m) : m)) }
+        )
+      );
+
+    const runNonStreaming = async () => {
       const res = await authFetch(`${API_BASE_URL}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -477,29 +512,79 @@ export default function Home() {
         throw new Error(d.detail || `Chat failed: ${res.status}`);
       }
       const data = await res.json();
-      if (data.conversation_id && data.conversation_id !== currentId) {
-        currentId = data.conversation_id;
-        setActiveId(currentId);
-      }
-      if (data.conversation_title) {
-        patchConv(currentId, (c) => ({ ...c, title: data.conversation_title }));
-      }
-      pushMessage(currentId, {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: data.answer,
-        sources: data.sources,
-        timestamp: new Date(),
+      if (data.conversation_title) patchConv(currentId, (c) => ({ ...c, title: data.conversation_title }));
+      updateAssistant((m) => ({ ...m, content: data.answer || "", sources: data.sources || [] }));
+    };
+
+    try {
+      const res = await authFetch(`${API_BASE_URL}/api/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, conversation_id: currentId }),
       });
+      if (res.status === 401) {
+        logout();
+        throw new Error("Session expired. Please sign in again.");
+      }
+
+      if (!res.ok || !res.body) {
+        // Streaming unavailable — fall back to the non-streaming endpoint.
+        await runNonStreaming();
+      } else {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let streamedAny = false;
+
+        const handleEvent = (evt: StreamEvent) => {
+          if (evt.type === "meta") {
+            if (evt.conversation_title) patchConv(currentId, (c) => ({ ...c, title: evt.conversation_title! }));
+            if (Array.isArray(evt.sources)) updateAssistant((m) => ({ ...m, sources: evt.sources }));
+          } else if (evt.type === "delta" && typeof evt.text === "string") {
+            streamedAny = true;
+            updateAssistant((m) => ({ ...m, content: m.content + evt.text }));
+          } else if (evt.type === "done") {
+            if (evt.conversation_title) patchConv(currentId, (c) => ({ ...c, title: evt.conversation_title! }));
+          } else if (evt.type === "error") {
+            throw new Error(evt.detail || "Failed to generate response");
+          }
+        };
+
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buffer.indexOf("\n\n")) >= 0) {
+            const frame = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 2);
+            if (!frame.startsWith("data:")) continue;
+            const jsonStr = frame.slice(5).trim();
+            if (!jsonStr) continue;
+            let evt: StreamEvent;
+            try {
+              evt = JSON.parse(jsonStr) as StreamEvent;
+            } catch {
+              continue;
+            }
+            handleEvent(evt);
+          }
+        }
+
+        // Nothing streamed (e.g. connection dropped) — try the non-streaming path.
+        if (!streamedAny) await runNonStreaming();
+      }
     } catch (err) {
       console.error(err);
-      pushMessage(currentId, {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: "Sorry, I encountered an error connecting to my brain.",
-        timestamp: new Date(),
-      });
+      const msg = err instanceof Error ? err.message : "";
+      updateAssistant((m) => ({
+        ...m,
+        content:
+          m.content ||
+          (msg.includes("Session expired") ? msg : "Sorry, I encountered an error connecting to my brain."),
+      }));
     } finally {
+      setStreamingId(null);
       setIsLoading(false);
     }
   };
@@ -947,19 +1032,58 @@ export default function Home() {
                         ? "bg-blue-600 text-white rounded-tr-sm shadow-md shadow-blue-900/20"
                         : "bg-white/[0.045] border border-white/[0.07] text-zinc-200 rounded-tl-sm"
                     }`}>
-                      <div className="whitespace-pre-wrap">{msg.content}</div>
+                      {msg.role === "user" ? (
+                        <div className="whitespace-pre-wrap">{msg.content}</div>
+                      ) : msg.content ? (
+                        <>
+                          <Markdown>{msg.content}</Markdown>
+                          {streamingId === msg.id && <span className="stream-caret" />}
+                        </>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 text-zinc-500">
+                          <span className="text-xs">Searching memories</span>
+                          <span className="w-1.5 h-1.5 bg-zinc-500 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                          <span className="w-1.5 h-1.5 bg-zinc-500 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                          <span className="w-1.5 h-1.5 bg-zinc-500 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                        </span>
+                      )}
                     </div>
 
                     {/* Sources + copy + timestamp */}
                     <div className={`flex flex-wrap items-center gap-1.5 ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}>
-                      {msg.sources && msg.sources.length > 0 && msg.sources.map((src, i) => (
-                        <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 bg-white/[0.04] border border-white/[0.06] rounded-md text-[11px] text-zinc-600">
-                          <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                          </svg>
-                          {typeof src.score === "number" ? src.score.toFixed(2) : "N/A"}
-                        </span>
-                      ))}
+                      {msg.sources && msg.sources.length > 0 && (() => {
+                        const seen = new Set<string>();
+                        const unique = msg.sources.filter((s) => {
+                          const key = s.document_id || s.title || "";
+                          if (!key || seen.has(key)) return false;
+                          seen.add(key);
+                          return true;
+                        });
+                        return unique.map((src, i) => {
+                          const label = src.title && src.title !== "Untitled" ? src.title : (src.source || "source");
+                          const clickable = Boolean(src.document_id);
+                          return (
+                            <button
+                              key={src.document_id || i}
+                              type="button"
+                              disabled={!clickable}
+                              onClick={() => {
+                                if (src.document_id) {
+                                  setCitationDocId(src.document_id);
+                                  setIsModalOpen(true);
+                                }
+                              }}
+                              title={typeof src.score === "number" ? `Relevance ${src.score.toFixed(2)}` : undefined}
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 bg-white/[0.04] border border-white/[0.06] rounded-md text-[11px] text-zinc-500 max-w-[180px] ${clickable ? "hover:bg-white/[0.08] hover:text-zinc-300 cursor-pointer" : "cursor-default"}`}
+                            >
+                              <svg className="w-2.5 h-2.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                              </svg>
+                              <span className="truncate">{label}</span>
+                            </button>
+                          );
+                        });
+                      })()}
                       {msg.role === "assistant" && (
                         <button
                           onClick={() => handleCopy(msg.id, msg.content)}
@@ -982,8 +1106,8 @@ export default function Home() {
                 </div>
               ))}
 
-              {/* Typing indicator */}
-              {isLoading && (
+              {/* Typing indicator (only when no streaming bubble is present) */}
+              {isLoading && !streamingId && (
                 <div className="flex gap-3 msg-animate">
                   <div className="w-7 h-7 rounded-lg flex-shrink-0 flex items-center justify-center mt-0.5 bg-gradient-to-br from-violet-600 to-purple-700">
                     <BrainIcon size={13} />
@@ -1202,7 +1326,7 @@ export default function Home() {
         </div>
       </nav>
 
-      <KnowledgeModal isOpen={isModalOpen} onClose={handleModalClose} />
+      <KnowledgeModal isOpen={isModalOpen} onClose={handleModalClose} focusDocId={citationDocId} />
       <AboutModal isOpen={isAboutOpen} onClose={() => setIsAboutOpen(false)} />
 
       {isProfileOpen && authUser && !authUser.is_guest && (

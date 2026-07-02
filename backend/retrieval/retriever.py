@@ -59,12 +59,15 @@ class Retriever:
         
         results = []
         for scored_point in search_result.points:
-            document_id = scored_point.payload.get("document_id", "")
+            payload = scored_point.payload or {}
+            document_id = payload.get("document_id", "")
+            title = payload.get("title") or payload.get("filename") or "Untitled"
             results.append({
                 "score": scored_point.score,
-                "content": scored_point.payload.get("content", ""),
-                "source": scored_point.payload.get("source", "unknown"),
+                "content": payload.get("content", ""),
+                "source": payload.get("source", "unknown"),
                 "document_id": document_id,
+                "title": title,
             })
 
             if len(results) >= top_k:

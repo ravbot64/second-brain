@@ -1,10 +1,12 @@
 from pathlib import Path
+import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 from qdrant_client import models as qmodels
 from sqlalchemy.exc import IntegrityError
@@ -69,6 +71,104 @@ def generate_llm_answer(prompt: str) -> Optional[str]:
     if last_error:
         print(f"LLM Error (all candidate models failed): {last_error}")
     return None
+
+
+def stream_llm_answer(prompt: str) -> Iterator[str]:
+    """Yield answer text deltas from Gemini, with model fallback before first token."""
+    global _working_llm_model
+
+    api_key = settings.GOOGLE_API_KEY
+    if not api_key:
+        return
+
+    from google import genai
+
+    client_gen = genai.Client(api_key=api_key)
+
+    candidates = [settings.LLM_MODEL] + [m for m in LLM_FALLBACK_MODELS if m != settings.LLM_MODEL]
+    if _working_llm_model:
+        candidates = [_working_llm_model] + [m for m in candidates if m != _working_llm_model]
+
+    last_error = None
+    for model_name in candidates:
+        emitted = False
+        try:
+            stream = client_gen.models.generate_content_stream(model=model_name, contents=prompt)
+            for chunk in stream:
+                text = getattr(chunk, "text", None)
+                if text:
+                    emitted = True
+                    yield text
+        except Exception as e:
+            last_error = e
+            if emitted:
+                # Never switch models mid-answer; a partial response was already sent.
+                _working_llm_model = model_name
+                return
+            continue
+
+        if emitted:
+            _working_llm_model = model_name
+            return
+
+    if last_error:
+        print(f"LLM stream error (all candidate models failed): {last_error}")
+
+
+CHAT_HISTORY_TURNS = 10
+CHAT_HISTORY_MSG_MAX_CHARS = 1500
+
+
+def build_history_text(db, conversation_id: str, user_id: str) -> str:
+    """Recent prior turns of a conversation, oldest first, bounded for prompt size."""
+    msgs = (
+        db.query(DBMessage)
+        .filter(DBMessage.conversation_id == conversation_id, DBMessage.user_id == user_id)
+        .order_by(DBMessage.created_at.asc())
+        .all()
+    )
+    if not msgs:
+        return ""
+
+    lines = []
+    for m in msgs[-CHAT_HISTORY_TURNS:]:
+        role = "User" if m.role == "user" else "Assistant"
+        content = (m.content or "").strip()
+        if len(content) > CHAT_HISTORY_MSG_MAX_CHARS:
+            content = content[:CHAT_HISTORY_MSG_MAX_CHARS] + "…"
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def build_chat_prompt(history_text: str, context: str, query: str) -> str:
+    parts = [
+        "You are a helpful assistant for the user's personal knowledge base. Use the "
+        "provided context to answer accurately and concisely. If the context doesn't "
+        "contain the answer, say so. Use Markdown formatting (lists, code blocks, bold) "
+        "when it improves readability.",
+    ]
+    if history_text:
+        parts.append(f"Conversation so far:\n{history_text}")
+    parts.append(f"Context:\n{context}")
+    parts.append(f"Question: {query}")
+    return "\n\n".join(parts)
+
+
+def slim_sources(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compact citation payload for the wire and history (no full chunk text)."""
+    return [
+        {
+            "score": r.get("score"),
+            "title": r.get("title") or "Untitled",
+            "source": r.get("source", "unknown"),
+            "document_id": r.get("document_id", ""),
+        }
+        for r in results
+    ]
+
+
+def _sse(data: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def visible_user_ids(current_user: DBUser) -> List[str]:
@@ -450,6 +550,64 @@ def delete_account(request: DeleteAccountRequest, current_user: DBUser = Depends
         db.close()
 
 
+def _prepare_chat(db, current_user: DBUser, request: ChatRequest):
+    """Resolve/create the conversation, set its title, and retrieve context.
+
+    Returns (conversation, results, history_text). Raises LookupError if a
+    referenced conversation does not belong to the user. Does not persist the
+    incoming user message (callers do that).
+    """
+    visible_ids = visible_user_ids(current_user)
+    docs = db.query(DBDocument.id).filter(DBDocument.user_id.in_(visible_ids)).all()
+    allowed_document_ids = {d[0] for d in docs}
+
+    if request.conversation_id:
+        conversation = db.query(DBConversation).filter(
+            DBConversation.id == request.conversation_id,
+            DBConversation.user_id == current_user.id,
+        ).first()
+        if not conversation:
+            raise LookupError("Conversation not found")
+    else:
+        conversation = DBConversation(
+            id=str(uuid.uuid4()),
+            user_id=current_user.id,
+            title="New conversation",
+        )
+        db.add(conversation)
+        db.flush()
+
+    trimmed_query = request.query.strip()
+    first_user_message = db.query(DBMessage.id).filter(
+        DBMessage.conversation_id == conversation.id,
+        DBMessage.user_id == current_user.id,
+        DBMessage.role == "user",
+    ).first()
+    if not first_user_message:
+        conversation.title = trimmed_query[:42] + ("…" if len(trimmed_query) > 42 else "")
+
+    # History is captured before the current user message is stored.
+    history_text = build_history_text(db, conversation.id, current_user.id)
+
+    if not allowed_document_ids:
+        results: List[Dict[str, Any]] = []
+    else:
+        results = retriever.search(request.query, allowed_document_ids=allowed_document_ids)
+
+    return conversation, results, history_text
+
+
+def _compose_answer(results: List[Dict[str, Any]], history_text: str, query: str) -> str:
+    if not results:
+        return "I couldn't find any relevant information in your Second Brain."
+
+    context = "\n\n".join(f"Source ({r['source']}):\n{r['content']}" for r in results)
+    if settings.GOOGLE_API_KEY:
+        prompt = build_chat_prompt(history_text, context, query)
+        return generate_llm_answer(prompt) or ("Based on your notes: " + results[0]["content"])
+    return f"Based on your notes, here is the most relevant snippet:\n\n\"{results[0]['content']}\""
+
+
 @router.post("/chat", response_model=ChatResponse)
 def handle_chat(request: ChatRequest, current_user: DBUser = Depends(get_current_user)):
     try:
@@ -459,86 +617,134 @@ def handle_chat(request: ChatRequest, current_user: DBUser = Depends(get_current
 
     db = SessionLocal()
     try:
-        visible_ids = visible_user_ids(current_user)
-        docs = db.query(DBDocument.id).filter(DBDocument.user_id.in_(visible_ids)).all()
-        allowed_document_ids = {d[0] for d in docs}
+        try:
+            conversation, results, history_text = _prepare_chat(db, current_user, request)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Conversation not found")
 
-        if request.conversation_id:
-            conversation = db.query(DBConversation).filter(
-                DBConversation.id == request.conversation_id,
-                DBConversation.user_id == current_user.id,
-            ).first()
-            if not conversation:
-                raise HTTPException(status_code=404, detail="Conversation not found")
-        else:
-            conversation = DBConversation(
-                id=str(uuid.uuid4()),
-                user_id=current_user.id,
-                title="New conversation",
-            )
-            db.add(conversation)
-            db.flush()
+        answer = _compose_answer(results, history_text, request.query)
+        sources = slim_sources(results)
 
-        trimmed_query = request.query.strip()
-        first_user_message = db.query(DBMessage.id).filter(
-            DBMessage.conversation_id == conversation.id,
-            DBMessage.user_id == current_user.id,
-            DBMessage.role == "user",
-        ).first()
-        if not first_user_message:
-            conversation.title = trimmed_query[:42] + ("…" if len(trimmed_query) > 42 else "")
-
-        if not allowed_document_ids:
-            results: List[Dict[str, Any]] = []
-            answer = "I couldn't find any relevant information in your Second Brain."
-        else:
-            results = retriever.search(request.query, allowed_document_ids=allowed_document_ids)
-            if not results:
-                answer = "I couldn't find any relevant information in your Second Brain."
-            else:
-                context = "\n\n".join([f"Source ({r['source']}):\n{r['content']}" for r in results])
-
-                if settings.GOOGLE_API_KEY:
-                    prompt = (
-                        "You are a helpful assistant. Use the provided context to answer the "
-                        "user's question accurately. If the context doesn't contain the answer, "
-                        f"say so.\n\nContext:\n{context}\n\nQuestion: {request.query}"
-                    )
-                    generated = generate_llm_answer(prompt)
-                    # Fall back to the top snippet if every model failed or returned empty text.
-                    answer = generated or ("Based on your notes: " + results[0]["content"])
-                else:
-                    answer = f"Based on your notes, here is the most relevant snippet:\n\n\"{results[0]['content']}\""
-
-        user_msg = DBMessage(
+        db.add(DBMessage(
             id=str(uuid.uuid4()),
             conversation_id=conversation.id,
             user_id=current_user.id,
             role="user",
             content=request.query,
             sources=[],
-        )
-        assistant_msg = DBMessage(
+        ))
+        db.add(DBMessage(
             id=str(uuid.uuid4()),
             conversation_id=conversation.id,
             user_id=current_user.id,
             role="assistant",
             content=answer,
-            sources=results,
-        )
-        db.add(user_msg)
-        db.add(assistant_msg)
+            sources=sources,
+        ))
         conversation.updated_at = datetime.now(timezone.utc)
         db.commit()
 
         return ChatResponse(
             answer=answer,
-            sources=results,
+            sources=sources,
             conversation_id=conversation.id,
             conversation_title=conversation.title,
         )
     finally:
         db.close()
+
+
+@router.post("/chat/stream")
+def handle_chat_stream(request: ChatRequest, current_user: DBUser = Depends(get_current_user)):
+    """Server-Sent Events variant of /chat that streams the answer token-by-token."""
+    try:
+        request.validate()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    def event_stream() -> Iterator[str]:
+        db = SessionLocal()
+        try:
+            try:
+                conversation, results, history_text = _prepare_chat(db, current_user, request)
+            except LookupError:
+                yield _sse({"type": "error", "detail": "Conversation not found"})
+                return
+
+            sources = slim_sources(results)
+            yield _sse({
+                "type": "meta",
+                "conversation_id": conversation.id,
+                "conversation_title": conversation.title,
+                "sources": sources,
+            })
+
+            db.add(DBMessage(
+                id=str(uuid.uuid4()),
+                conversation_id=conversation.id,
+                user_id=current_user.id,
+                role="user",
+                content=request.query,
+                sources=[],
+            ))
+            db.flush()
+
+            chunks: List[str] = []
+            if not results:
+                text = "I couldn't find any relevant information in your Second Brain."
+                chunks.append(text)
+                yield _sse({"type": "delta", "text": text})
+            elif settings.GOOGLE_API_KEY:
+                context = "\n\n".join(f"Source ({r['source']}):\n{r['content']}" for r in results)
+                prompt = build_chat_prompt(history_text, context, request.query)
+                for delta in stream_llm_answer(prompt):
+                    chunks.append(delta)
+                    yield _sse({"type": "delta", "text": delta})
+                if not "".join(chunks).strip():
+                    fallback = "Based on your notes: " + results[0]["content"]
+                    chunks.append(fallback)
+                    yield _sse({"type": "delta", "text": fallback})
+            else:
+                text = f"Based on your notes, here is the most relevant snippet:\n\n\"{results[0]['content']}\""
+                chunks.append(text)
+                yield _sse({"type": "delta", "text": text})
+
+            answer = "".join(chunks).strip()
+            db.add(DBMessage(
+                id=str(uuid.uuid4()),
+                conversation_id=conversation.id,
+                user_id=current_user.id,
+                role="assistant",
+                content=answer,
+                sources=sources,
+            ))
+            conversation.updated_at = datetime.now(timezone.utc)
+            db.commit()
+
+            yield _sse({
+                "type": "done",
+                "conversation_id": conversation.id,
+                "conversation_title": conversation.title,
+            })
+        except Exception as e:
+            print(f"Chat stream error: {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            yield _sse({"type": "error", "detail": "Failed to generate response"})
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/ingest/upload")

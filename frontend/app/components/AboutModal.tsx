@@ -186,10 +186,10 @@ export default function AboutModal({ isOpen, onClose }: { isOpen: boolean; onClo
           <section>
             <h3 className="text-lg font-semibold text-white mb-3">💡 Tips</h3>
             <ul className="space-y-2 text-[#a1a1aa] text-sm">
-              <li>• Use detailed note titles so they're easily identifiable in results</li>
+              <li>• Use detailed note titles so they&apos;re easily identifiable in results</li>
               <li>• Ask specific questions for better answers (vs. vague queries)</li>
               <li>• Organize notes by topic/project for cleaner management</li>
-              <li>• Check the "Qdrant Vector DB" status — green means your brain is ready!</li>
+              <li>• Check the &quot;Qdrant Vector DB&quot; status — green means your brain is ready!</li>
               <li>• Use Cmd/Ctrl+S in the notepad editor to save quickly</li>
             </ul>
           </section>
