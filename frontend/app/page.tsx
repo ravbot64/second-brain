@@ -123,7 +123,6 @@ export default function Home() {
   const messages = activeConversation?.messages ?? [];
 
   const [input, setInput] = useState("");
-  const [chatMode, setChatMode] = useState<ChatMode>("brain");
   const [savedToBrainIds, setSavedToBrainIds] = useState<Set<string>>(new Set());
   const [isLoading, setIsLoading] = useState(false);
   const [streamingId, setStreamingId] = useState<string | null>(null);
@@ -455,7 +454,9 @@ export default function Home() {
 
   const sendQuery = async (query: string, modeOverride?: ChatMode) => {
     if (!query.trim() || isLoading || !token) return;
-    const mode: ChatMode = modeOverride ?? chatMode;
+    // Brain-first: default to searching the user's notes; web/general are only
+    // reached via the fallback buttons on a "not found in your notes" answer.
+    const mode: ChatMode = modeOverride ?? "brain";
     let currentId = activeIdRef.current;
 
     if (!currentId) {
@@ -1212,7 +1213,7 @@ export default function Home() {
                       if (!q) return null;
                       return (
                         <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="text-[11px] text-zinc-600">Not in your notes —</span>
+                          <span className="text-[11px] text-zinc-600">Try instead:</span>
                           <button
                             onClick={() => sendQuery(q, "web")}
                             disabled={isLoading}
@@ -1255,34 +1256,7 @@ export default function Home() {
 
         {/* ── Input bar ── */}
         <div className="absolute bottom-0 left-0 right-0 z-20 px-3 sm:px-4 md:px-8 pb-20 md:pb-6 pt-10 md:pt-16 bg-gradient-to-t from-[#08080a] via-[#08080a]/90 to-transparent">
-          <form onSubmit={handleSubmit} className="max-w-3xl mx-auto">
-
-            {/* Answer mode toggle */}
-            <div className="flex items-center justify-center gap-1 mb-2">
-              {(["brain", "web", "general"] as ChatMode[]).map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => setChatMode(m)}
-                  title={
-                    m === "brain"
-                      ? "Answer only from your notes"
-                      : m === "web"
-                      ? "Answer using a live web search"
-                      : "Answer from the model's general knowledge"
-                  }
-                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-colors ${
-                    chatMode === m
-                      ? "bg-blue-600 text-white border-blue-500"
-                      : "bg-white/[0.03] text-zinc-500 border-white/[0.07] hover:text-zinc-300"
-                  }`}
-                >
-                  {m === "brain" ? "Brain" : m === "web" ? "Web" : "General"}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex items-end gap-2">
+          <form onSubmit={handleSubmit} className="max-w-3xl mx-auto flex items-end gap-2">
 
             {/* File upload */}
             <div>
@@ -1386,7 +1360,6 @@ export default function Home() {
                   </svg>
                 </button>
               </div>
-            </div>
             </div>
           </form>
         </div>

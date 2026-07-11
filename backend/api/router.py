@@ -119,6 +119,14 @@ def stream_llm_answer(prompt: str) -> Iterator[str]:
 CHAT_HISTORY_TURNS = 10
 CHAT_HISTORY_MSG_MAX_CHARS = 1500
 
+# Deterministic marker the model must emit when the user's notes don't cover the
+# question. Lets the UI reliably offer web/general fallback for that turn.
+NOT_FOUND_SENTINEL = "I couldn't find this in your notes."
+
+
+def _is_not_found(answer: str) -> bool:
+    return answer.strip().lower().startswith("i couldn't find this in your notes")
+
 
 def build_history_text(db, conversation_id: str, user_id: str) -> str:
     """Recent prior turns of a conversation, oldest first, bounded for prompt size."""
@@ -143,9 +151,10 @@ def build_history_text(db, conversation_id: str, user_id: str) -> str:
 
 def build_chat_prompt(history_text: str, context: str, query: str) -> str:
     parts = [
-        "You are a helpful assistant for the user's personal knowledge base. Use the "
-        "provided context to answer accurately and concisely. If the context doesn't "
-        "contain the answer, say so. Use Markdown formatting (lists, code blocks, bold) "
+        "You are a helpful assistant for the user's personal knowledge base. Use ONLY the "
+        "provided context to answer accurately and concisely. If the context does not "
+        "contain the answer, reply with EXACTLY this sentence and nothing else: "
+        f"\"{NOT_FOUND_SENTINEL}\" Use Markdown formatting (lists, code blocks, bold) "
         "when it improves readability.",
     ]
     if history_text:
@@ -711,7 +720,7 @@ def _prepare_chat(db, current_user: DBUser, request: ChatRequest):
 
 def _compose_answer(results: List[Dict[str, Any]], history_text: str, query: str) -> str:
     if not results:
-        return "I couldn't find any relevant information in your Second Brain."
+        return NOT_FOUND_SENTINEL
 
     context = "\n\n".join(f"Source ({r['source']}):\n{r['content']}" for r in results)
     if settings.GOOGLE_API_KEY:
@@ -756,7 +765,7 @@ def handle_chat(request: ChatRequest, current_user: DBUser = Depends(get_current
         else:  # brain
             answer = _compose_answer(results, history_text, request.query)
             sources = slim_sources(results)
-            grounded = bool(results)
+            grounded = bool(results) and not _is_not_found(answer)
 
         db.add(DBMessage(
             id=str(uuid.uuid4()),
@@ -853,7 +862,7 @@ def handle_chat_stream(request: ChatRequest, current_user: DBUser = Depends(get_
                     yield _sse({"type": "delta", "text": text})
             elif mode == "brain":
                 if not results:
-                    text = "I couldn't find any relevant information in your Second Brain."
+                    text = NOT_FOUND_SENTINEL
                     chunks.append(text)
                     yield _sse({"type": "delta", "text": text})
                 elif settings.GOOGLE_API_KEY:
@@ -873,6 +882,8 @@ def handle_chat_stream(request: ChatRequest, current_user: DBUser = Depends(get_
 
             final_sources = web_sources if mode == "web" else brain_sources
             answer = "".join(chunks).strip()
+            if mode == "brain":
+                grounded = bool(results) and not _is_not_found(answer)
             db.add(DBMessage(
                 id=str(uuid.uuid4()),
                 conversation_id=conversation.id,
