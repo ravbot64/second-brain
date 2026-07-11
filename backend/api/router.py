@@ -209,53 +209,76 @@ def _extract_web_sources(response) -> List[Dict[str, Any]]:
     return sources
 
 
-def _web_client():
-    from google import genai
-    return genai.Client(api_key=settings.GOOGLE_API_KEY)
-
-
-def _google_search_config():
-    from google.genai import types
-    return types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())])
+def _web_candidate_models() -> List[str]:
+    candidates = [settings.LLM_MODEL] + [m for m in LLM_FALLBACK_MODELS if m != settings.LLM_MODEL]
+    if _working_llm_model:
+        candidates = [_working_llm_model] + [m for m in candidates if m != _working_llm_model]
+    return candidates
 
 
 def generate_web_answer(history_text: str, query: str):
     """Return (answer_text or None, web_sources) via Gemini Google Search grounding."""
     if not settings.GOOGLE_API_KEY:
         return None, []
-    try:
-        response = _web_client().models.generate_content(
-            model=settings.LLM_MODEL,
-            contents=build_web_prompt(history_text, query),
-            config=_google_search_config(),
-        )
-        text = (response.text or "").strip()
-        return (text or None), _extract_web_sources(response)
-    except Exception as e:
-        print(f"Web grounding failed: {e}")
-        return None, []
+
+    from google import genai
+    from google.genai import types
+
+    client_gen = genai.Client(api_key=settings.GOOGLE_API_KEY)
+    config = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())])
+    prompt = build_web_prompt(history_text, query)
+
+    last_error = None
+    for model_name in _web_candidate_models():
+        try:
+            response = client_gen.models.generate_content(model=model_name, contents=prompt, config=config)
+            text = (response.text or "").strip()
+            if text:
+                return text, _extract_web_sources(response)
+        except Exception as e:
+            last_error = e
+    if last_error:
+        print(f"Web grounding failed for all candidate models: {last_error}")
+    return None, []
 
 
 def stream_web_answer(history_text: str, query: str, sources_out: List[Dict[str, Any]]) -> Iterator[str]:
     """Yield deltas from a grounded web answer; collect citations into sources_out."""
     if not settings.GOOGLE_API_KEY:
         return
-    try:
-        stream = _web_client().models.generate_content_stream(
-            model=settings.LLM_MODEL,
-            contents=build_web_prompt(history_text, query),
-            config=_google_search_config(),
-        )
-        for chunk in stream:
-            text = getattr(chunk, "text", None)
-            if text:
-                yield text
-            found = _extract_web_sources(chunk)
-            if found:
-                sources_out.clear()
-                sources_out.extend(found)
-    except Exception as e:
-        print(f"Web grounding stream failed: {e}")
+
+    from google import genai
+    from google.genai import types
+
+    # Keep the client referenced for the whole stream — otherwise it is garbage
+    # collected mid-iteration and the HTTP connection closes ("client has been closed").
+    client_gen = genai.Client(api_key=settings.GOOGLE_API_KEY)
+    config = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())])
+    prompt = build_web_prompt(history_text, query)
+
+    last_error = None
+    for model_name in _web_candidate_models():
+        emitted = False
+        try:
+            stream = client_gen.models.generate_content_stream(model=model_name, contents=prompt, config=config)
+            for chunk in stream:
+                text = getattr(chunk, "text", None)
+                if text:
+                    emitted = True
+                    yield text
+                found = _extract_web_sources(chunk)
+                if found:
+                    sources_out.clear()
+                    sources_out.extend(found)
+        except Exception as e:
+            last_error = e
+            if emitted:
+                return  # partial answer already sent; don't switch models mid-stream
+            continue
+        if emitted:
+            return
+    if last_error:
+        print(f"Web grounding stream failed for all candidate models: {last_error}")
 
 
 def web_search_allowed(current_user: DBUser) -> bool:
@@ -849,8 +872,15 @@ def handle_chat_stream(request: ChatRequest, current_user: DBUser = Depends(get_
                     chunks.append(delta)
                     yield _sse({"type": "delta", "text": delta})
                 if not "".join(chunks).strip():
-                    mode = "general"  # grounding unavailable -> fall back
-                    web_sources = []
+                    # Streaming grounding produced nothing; try a non-streaming grounded call.
+                    text, ns_sources = generate_web_answer(history_text, request.query)
+                    if text:
+                        web_sources = ns_sources
+                        chunks.append(text)
+                        yield _sse({"type": "delta", "text": text})
+                    else:
+                        mode = "general"  # grounding truly unavailable -> fall back
+                        web_sources = []
 
             if mode == "general":
                 for delta in stream_llm_answer(build_general_prompt(history_text, request.query)):
