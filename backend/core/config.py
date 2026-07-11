@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 50  # word overlap between chunks
     LLM_MODEL: str = "gemini-3-flash"  # Free-tier workhorse; falls back automatically if unavailable
     EMBEDDING_MODEL: str = "gemini-embedding-001"  # Must match the model used at ingestion time
+    ENABLE_WEB_SEARCH: bool = True  # Allow the "web" answer mode (Gemini Google Search grounding)
+    WEB_SEARCH_FOR_GUESTS: bool = True  # Set False to keep web-search cost off guest sessions
     RETRIEVAL_TOP_K: int = 5  # top K chunks to retrieve
     
     @property

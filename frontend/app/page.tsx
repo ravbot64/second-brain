@@ -7,7 +7,9 @@ import Markdown from "./components/Markdown";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
 
-type Source = { score?: number; source?: string; title?: string; document_id?: string };
+type ChatMode = "brain" | "web" | "general";
+
+type Source = { score?: number; source?: string; title?: string; document_id?: string; type?: string; uri?: string };
 
 type StreamEvent = {
   type: "meta" | "delta" | "done" | "error";
@@ -15,6 +17,8 @@ type StreamEvent = {
   sources?: Source[];
   conversation_id?: string;
   conversation_title?: string;
+  mode?: ChatMode;
+  grounded?: boolean;
   detail?: string;
 };
 
@@ -24,6 +28,8 @@ type Message = {
   content: string;
   sources?: Source[];
   timestamp: Date;
+  mode?: ChatMode;
+  grounded?: boolean;
 };
 
 type Conversation = {
@@ -117,6 +123,8 @@ export default function Home() {
   const messages = activeConversation?.messages ?? [];
 
   const [input, setInput] = useState("");
+  const [chatMode, setChatMode] = useState<ChatMode>("brain");
+  const [savedToBrainIds, setSavedToBrainIds] = useState<Set<string>>(new Set());
   const [isLoading, setIsLoading] = useState(false);
   const [streamingId, setStreamingId] = useState<string | null>(null);
   const [citationDocId, setCitationDocId] = useState<string | null>(null);
@@ -445,8 +453,9 @@ export default function Home() {
     return `${Math.floor(hrs / 24)}d ago`;
   };
 
-  const sendQuery = async (query: string) => {
+  const sendQuery = async (query: string, modeOverride?: ChatMode) => {
     if (!query.trim() || isLoading || !token) return;
+    const mode: ChatMode = modeOverride ?? chatMode;
     let currentId = activeIdRef.current;
 
     if (!currentId) {
@@ -485,6 +494,7 @@ export default function Home() {
       content: "",
       sources: [],
       timestamp: new Date(),
+      mode,
     });
     setStreamingId(assistantId);
 
@@ -501,7 +511,7 @@ export default function Home() {
       const res = await authFetch(`${API_BASE_URL}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, conversation_id: currentId }),
+        body: JSON.stringify({ query, conversation_id: currentId, mode }),
       });
       if (res.status === 401) {
         logout();
@@ -513,14 +523,20 @@ export default function Home() {
       }
       const data = await res.json();
       if (data.conversation_title) patchConv(currentId, (c) => ({ ...c, title: data.conversation_title }));
-      updateAssistant((m) => ({ ...m, content: data.answer || "", sources: data.sources || [] }));
+      updateAssistant((m) => ({
+        ...m,
+        content: data.answer || "",
+        sources: data.sources || [],
+        mode: data.mode ?? mode,
+        grounded: data.grounded,
+      }));
     };
 
     try {
       const res = await authFetch(`${API_BASE_URL}/api/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, conversation_id: currentId }),
+        body: JSON.stringify({ query, conversation_id: currentId, mode }),
       });
       if (res.status === 401) {
         logout();
@@ -539,12 +555,23 @@ export default function Home() {
         const handleEvent = (evt: StreamEvent) => {
           if (evt.type === "meta") {
             if (evt.conversation_title) patchConv(currentId, (c) => ({ ...c, title: evt.conversation_title! }));
-            if (Array.isArray(evt.sources)) updateAssistant((m) => ({ ...m, sources: evt.sources }));
+            updateAssistant((m) => ({
+              ...m,
+              sources: Array.isArray(evt.sources) ? evt.sources : m.sources,
+              mode: evt.mode ?? m.mode,
+              grounded: evt.grounded ?? m.grounded,
+            }));
           } else if (evt.type === "delta" && typeof evt.text === "string") {
             streamedAny = true;
             updateAssistant((m) => ({ ...m, content: m.content + evt.text }));
           } else if (evt.type === "done") {
             if (evt.conversation_title) patchConv(currentId, (c) => ({ ...c, title: evt.conversation_title! }));
+            updateAssistant((m) => ({
+              ...m,
+              mode: evt.mode ?? m.mode,
+              grounded: evt.grounded ?? m.grounded,
+              sources: Array.isArray(evt.sources) && evt.sources.length ? evt.sources : m.sources,
+            }));
           } else if (evt.type === "error") {
             throw new Error(evt.detail || "Failed to generate response");
           }
@@ -600,6 +627,35 @@ export default function Home() {
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 2000);
     } catch {}
+  };
+
+  const addToBrain = async (message: Message, sourceQuery: string) => {
+    if (!token || savedToBrainIds.has(message.id) || !message.content) return;
+    const title = (sourceQuery || "Saved answer").trim().slice(0, 80) || "Saved answer";
+    const links = (message.sources || [])
+      .filter((s) => s.uri)
+      .map((s) => `- ${s.title || s.uri}: ${s.uri}`)
+      .join("\n");
+    const text = message.content + (links ? `\n\nSources:\n${links}` : "");
+    try {
+      const res = await authFetch(`${API_BASE_URL}/api/ingest/text`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, text }),
+      });
+      if (res.status === 401) {
+        logout();
+        return;
+      }
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.detail || "Failed to save to brain");
+      }
+      setSavedToBrainIds((prev) => new Set(prev).add(message.id));
+      setTimeout(() => checkDocumentCount(true), 1500);
+    } catch (e) {
+      showError(e instanceof Error ? e.message : "Failed to save to brain");
+    }
   };
 
   const submitAuth = async (mode: "login" | "register") => {
@@ -1051,15 +1107,41 @@ export default function Home() {
 
                     {/* Sources + copy + timestamp */}
                     <div className={`flex flex-wrap items-center gap-1.5 ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}>
+                      {msg.role === "assistant" && (msg.mode === "web" || msg.mode === "general") && (
+                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium border ${
+                          msg.mode === "web"
+                            ? "bg-blue-500/10 border-blue-500/25 text-blue-300"
+                            : "bg-violet-500/10 border-violet-500/25 text-violet-300"
+                        }`}>
+                          {msg.mode === "web" ? "Web" : "General AI"}
+                        </span>
+                      )}
                       {msg.sources && msg.sources.length > 0 && (() => {
                         const seen = new Set<string>();
                         const unique = msg.sources.filter((s) => {
-                          const key = s.document_id || s.title || "";
+                          const key = (s.type === "web" ? s.uri : s.document_id) || s.title || "";
                           if (!key || seen.has(key)) return false;
                           seen.add(key);
                           return true;
                         });
                         return unique.map((src, i) => {
+                          if (src.type === "web" && src.uri) {
+                            return (
+                              <a
+                                key={src.uri}
+                                href={src.uri}
+                                target="_blank"
+                                rel="noopener noreferrer nofollow"
+                                title={src.uri}
+                                className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-500/10 border border-blue-500/20 rounded-md text-[11px] text-blue-300 hover:bg-blue-500/20 max-w-[200px]"
+                              >
+                                <svg className="w-2.5 h-2.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13.828 10.172a4 4 0 010 5.656l-3 3a4 4 0 01-5.656-5.656l1.5-1.5M10.172 13.828a4 4 0 010-5.656l3-3a4 4 0 015.656 5.656l-1.5 1.5" />
+                                </svg>
+                                <span className="truncate">{src.title || src.uri}</span>
+                              </a>
+                            );
+                          }
                           const label = src.title && src.title !== "Untitled" ? src.title : (src.source || "source");
                           const clickable = Boolean(src.document_id);
                           return (
@@ -1098,10 +1180,56 @@ export default function Home() {
                           )}
                         </button>
                       )}
+                      {msg.role === "assistant" && streamingId !== msg.id && Boolean(msg.content) && (msg.mode === "web" || msg.mode === "general") && (() => {
+                        const idx = messages.findIndex((x) => x.id === msg.id);
+                        const q = idx > 0 ? messages[idx - 1]?.content ?? "" : "";
+                        const saved = savedToBrainIds.has(msg.id);
+                        return (
+                          <button
+                            onClick={() => addToBrain(msg, q)}
+                            disabled={saved}
+                            className={`inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded-md transition-colors ${
+                              saved ? "text-emerald-400" : "text-zinc-700 hover:text-zinc-300 hover:bg-white/[0.04]"
+                            }`}
+                          >
+                            {saved ? (
+                              <><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg> Added to brain</>
+                            ) : (
+                              <><svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg> Add to brain</>
+                            )}
+                          </button>
+                        );
+                      })()}
                       <span className="text-[10px] text-zinc-800 tabular-nums">
                         {msg.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                       </span>
                     </div>
+
+                    {/* Fallback options when the brain had no relevant context */}
+                    {msg.role === "assistant" && msg.grounded === false && streamingId !== msg.id && (() => {
+                      const idx = messages.findIndex((x) => x.id === msg.id);
+                      const q = idx > 0 ? messages[idx - 1]?.content ?? "" : "";
+                      if (!q) return null;
+                      return (
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="text-[11px] text-zinc-600">Not in your notes —</span>
+                          <button
+                            onClick={() => sendQuery(q, "web")}
+                            disabled={isLoading}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-blue-500/10 border border-blue-500/25 text-blue-300 hover:bg-blue-500/20 disabled:opacity-40"
+                          >
+                            Search the web
+                          </button>
+                          <button
+                            onClick={() => sendQuery(q, "general")}
+                            disabled={isLoading}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-white/[0.05] border border-white/[0.1] text-zinc-300 hover:bg-white/[0.09] disabled:opacity-40"
+                          >
+                            Answer without my notes
+                          </button>
+                        </div>
+                      );
+                    })()}
                   </div>
                 </div>
               ))}
@@ -1127,7 +1255,34 @@ export default function Home() {
 
         {/* ── Input bar ── */}
         <div className="absolute bottom-0 left-0 right-0 z-20 px-3 sm:px-4 md:px-8 pb-20 md:pb-6 pt-10 md:pt-16 bg-gradient-to-t from-[#08080a] via-[#08080a]/90 to-transparent">
-          <form onSubmit={handleSubmit} className="max-w-3xl mx-auto flex items-end gap-2">
+          <form onSubmit={handleSubmit} className="max-w-3xl mx-auto">
+
+            {/* Answer mode toggle */}
+            <div className="flex items-center justify-center gap-1 mb-2">
+              {(["brain", "web", "general"] as ChatMode[]).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setChatMode(m)}
+                  title={
+                    m === "brain"
+                      ? "Answer only from your notes"
+                      : m === "web"
+                      ? "Answer using a live web search"
+                      : "Answer from the model's general knowledge"
+                  }
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-colors ${
+                    chatMode === m
+                      ? "bg-blue-600 text-white border-blue-500"
+                      : "bg-white/[0.03] text-zinc-500 border-white/[0.07] hover:text-zinc-300"
+                  }`}
+                >
+                  {m === "brain" ? "Brain" : m === "web" ? "Web" : "General"}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-end gap-2">
 
             {/* File upload */}
             <div>
@@ -1231,6 +1386,7 @@ export default function Home() {
                   </svg>
                 </button>
               </div>
+            </div>
             </div>
           </form>
         </div>

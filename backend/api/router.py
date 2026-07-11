@@ -155,6 +155,108 @@ def build_chat_prompt(history_text: str, context: str, query: str) -> str:
     return "\n\n".join(parts)
 
 
+def build_general_prompt(history_text: str, query: str) -> str:
+    parts = [
+        "You are a helpful, knowledgeable assistant. Answer the user's question directly "
+        "and accurately from your general knowledge. Use Markdown formatting when it "
+        "improves readability. If you are unsure, say so.",
+    ]
+    if history_text:
+        parts.append(f"Conversation so far:\n{history_text}")
+    parts.append(f"Question: {query}")
+    return "\n\n".join(parts)
+
+
+def build_web_prompt(history_text: str, query: str) -> str:
+    parts = [
+        "You are a helpful assistant with access to Google Search. Answer the user's "
+        "question accurately using current information from the web. Use Markdown "
+        "formatting when it improves readability.",
+    ]
+    if history_text:
+        parts.append(f"Conversation so far:\n{history_text}")
+    parts.append(f"Question: {query}")
+    return "\n\n".join(parts)
+
+
+def _extract_web_sources(response) -> List[Dict[str, Any]]:
+    """Pull {type, title, uri} web citations from a Gemini grounded response/chunk."""
+    sources: List[Dict[str, Any]] = []
+    seen = set()
+    try:
+        for cand in (getattr(response, "candidates", None) or []):
+            gm = getattr(cand, "grounding_metadata", None)
+            for gc in (getattr(gm, "grounding_chunks", None) or []):
+                web = getattr(gc, "web", None)
+                if not web:
+                    continue
+                uri = getattr(web, "uri", None)
+                if not uri or uri in seen:
+                    continue
+                seen.add(uri)
+                sources.append({"type": "web", "title": getattr(web, "title", None) or uri, "uri": uri})
+    except Exception:
+        pass
+    return sources
+
+
+def _web_client():
+    from google import genai
+    return genai.Client(api_key=settings.GOOGLE_API_KEY)
+
+
+def _google_search_config():
+    from google.genai import types
+    return types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())])
+
+
+def generate_web_answer(history_text: str, query: str):
+    """Return (answer_text or None, web_sources) via Gemini Google Search grounding."""
+    if not settings.GOOGLE_API_KEY:
+        return None, []
+    try:
+        response = _web_client().models.generate_content(
+            model=settings.LLM_MODEL,
+            contents=build_web_prompt(history_text, query),
+            config=_google_search_config(),
+        )
+        text = (response.text or "").strip()
+        return (text or None), _extract_web_sources(response)
+    except Exception as e:
+        print(f"Web grounding failed: {e}")
+        return None, []
+
+
+def stream_web_answer(history_text: str, query: str, sources_out: List[Dict[str, Any]]) -> Iterator[str]:
+    """Yield deltas from a grounded web answer; collect citations into sources_out."""
+    if not settings.GOOGLE_API_KEY:
+        return
+    try:
+        stream = _web_client().models.generate_content_stream(
+            model=settings.LLM_MODEL,
+            contents=build_web_prompt(history_text, query),
+            config=_google_search_config(),
+        )
+        for chunk in stream:
+            text = getattr(chunk, "text", None)
+            if text:
+                yield text
+            found = _extract_web_sources(chunk)
+            if found:
+                sources_out.clear()
+                sources_out.extend(found)
+    except Exception as e:
+        print(f"Web grounding stream failed: {e}")
+
+
+def web_search_allowed(current_user: DBUser) -> bool:
+    if not settings.ENABLE_WEB_SEARCH:
+        return False
+    if current_user.is_guest and not settings.WEB_SEARCH_FOR_GUESTS:
+        return False
+    return True
+
+
 def slim_sources(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Compact citation payload for the wire and history (no full chunk text)."""
     return [
@@ -244,15 +346,21 @@ class AuthResponse(BaseModel):
     user: Dict[str, Any]
 
 
+CHAT_MODES = {"brain", "web", "general"}
+
+
 class ChatRequest(BaseModel):
     query: str
     conversation_id: Optional[str] = None
+    mode: str = "brain"  # "brain" (RAG) | "web" (Google Search grounding) | "general" (model knowledge)
 
     def validate(self):
         if not self.query or not self.query.strip():
             raise ValueError("Query cannot be empty")
         if len(self.query) > settings.MAX_QUERY_LENGTH:
             raise ValueError(f"Query exceeds maximum length of {settings.MAX_QUERY_LENGTH} characters")
+        if self.mode not in CHAT_MODES:
+            raise ValueError(f"Invalid mode. Allowed: {', '.join(sorted(CHAT_MODES))}")
         return self
 
 
@@ -261,6 +369,8 @@ class ChatResponse(BaseModel):
     sources: List[Dict[str, Any]]
     conversation_id: str
     conversation_title: str
+    mode: str = "brain"
+    grounded: bool = True
 
 
 class RawTextRequest(BaseModel):
@@ -590,10 +700,11 @@ def _prepare_chat(db, current_user: DBUser, request: ChatRequest):
     # History is captured before the current user message is stored.
     history_text = build_history_text(db, conversation.id, current_user.id)
 
-    if not allowed_document_ids:
-        results: List[Dict[str, Any]] = []
-    else:
+    # Only the brain mode searches the user's notes; web/general skip retrieval.
+    if request.mode == "brain" and allowed_document_ids:
         results = retriever.search(request.query, allowed_document_ids=allowed_document_ids)
+    else:
+        results: List[Dict[str, Any]] = []
 
     return conversation, results, history_text
 
@@ -623,8 +734,29 @@ def handle_chat(request: ChatRequest, current_user: DBUser = Depends(get_current
         except LookupError:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        answer = _compose_answer(results, history_text, request.query)
-        sources = slim_sources(results)
+        mode = request.mode
+        if mode == "web" and not web_search_allowed(current_user):
+            mode = "general"
+
+        sources: List[Dict[str, Any]] = []
+        if mode == "web":
+            text, sources = generate_web_answer(history_text, request.query)
+            if not text:
+                mode = "general"  # grounding unavailable -> fall back to general knowledge
+                sources = []
+
+        if mode == "general":
+            answer = generate_llm_answer(build_general_prompt(history_text, request.query)) or (
+                "I couldn't generate an answer right now."
+            )
+            grounded = True
+        elif mode == "web":
+            answer = text
+            grounded = True
+        else:  # brain
+            answer = _compose_answer(results, history_text, request.query)
+            sources = slim_sources(results)
+            grounded = bool(results)
 
         db.add(DBMessage(
             id=str(uuid.uuid4()),
@@ -650,6 +782,8 @@ def handle_chat(request: ChatRequest, current_user: DBUser = Depends(get_current
             sources=sources,
             conversation_id=conversation.id,
             conversation_title=conversation.title,
+            mode=mode,
+            grounded=grounded,
         )
     finally:
         db.close()
@@ -672,12 +806,20 @@ def handle_chat_stream(request: ChatRequest, current_user: DBUser = Depends(get_
                 yield _sse({"type": "error", "detail": "Conversation not found"})
                 return
 
-            sources = slim_sources(results)
+            mode = request.mode
+            if mode == "web" and not web_search_allowed(current_user):
+                mode = "general"
+
+            brain_sources = slim_sources(results) if mode == "brain" else []
+            grounded = bool(results) if mode == "brain" else True
+
             yield _sse({
                 "type": "meta",
                 "conversation_id": conversation.id,
                 "conversation_title": conversation.title,
-                "sources": sources,
+                "sources": brain_sources,
+                "mode": mode,
+                "grounded": grounded,
             })
 
             db.add(DBMessage(
@@ -691,25 +833,45 @@ def handle_chat_stream(request: ChatRequest, current_user: DBUser = Depends(get_
             db.flush()
 
             chunks: List[str] = []
-            if not results:
-                text = "I couldn't find any relevant information in your Second Brain."
-                chunks.append(text)
-                yield _sse({"type": "delta", "text": text})
-            elif settings.GOOGLE_API_KEY:
-                context = "\n\n".join(f"Source ({r['source']}):\n{r['content']}" for r in results)
-                prompt = build_chat_prompt(history_text, context, request.query)
-                for delta in stream_llm_answer(prompt):
+            web_sources: List[Dict[str, Any]] = []
+
+            if mode == "web":
+                for delta in stream_web_answer(history_text, request.query, web_sources):
                     chunks.append(delta)
                     yield _sse({"type": "delta", "text": delta})
                 if not "".join(chunks).strip():
-                    fallback = "Based on your notes: " + results[0]["content"]
-                    chunks.append(fallback)
-                    yield _sse({"type": "delta", "text": fallback})
-            else:
-                text = f"Based on your notes, here is the most relevant snippet:\n\n\"{results[0]['content']}\""
-                chunks.append(text)
-                yield _sse({"type": "delta", "text": text})
+                    mode = "general"  # grounding unavailable -> fall back
+                    web_sources = []
 
+            if mode == "general":
+                for delta in stream_llm_answer(build_general_prompt(history_text, request.query)):
+                    chunks.append(delta)
+                    yield _sse({"type": "delta", "text": delta})
+                if not "".join(chunks).strip():
+                    text = "I couldn't generate an answer right now."
+                    chunks.append(text)
+                    yield _sse({"type": "delta", "text": text})
+            elif mode == "brain":
+                if not results:
+                    text = "I couldn't find any relevant information in your Second Brain."
+                    chunks.append(text)
+                    yield _sse({"type": "delta", "text": text})
+                elif settings.GOOGLE_API_KEY:
+                    context = "\n\n".join(f"Source ({r['source']}):\n{r['content']}" for r in results)
+                    prompt = build_chat_prompt(history_text, context, request.query)
+                    for delta in stream_llm_answer(prompt):
+                        chunks.append(delta)
+                        yield _sse({"type": "delta", "text": delta})
+                    if not "".join(chunks).strip():
+                        fallback = "Based on your notes: " + results[0]["content"]
+                        chunks.append(fallback)
+                        yield _sse({"type": "delta", "text": fallback})
+                else:
+                    text = f"Based on your notes, here is the most relevant snippet:\n\n\"{results[0]['content']}\""
+                    chunks.append(text)
+                    yield _sse({"type": "delta", "text": text})
+
+            final_sources = web_sources if mode == "web" else brain_sources
             answer = "".join(chunks).strip()
             db.add(DBMessage(
                 id=str(uuid.uuid4()),
@@ -717,7 +879,7 @@ def handle_chat_stream(request: ChatRequest, current_user: DBUser = Depends(get_
                 user_id=current_user.id,
                 role="assistant",
                 content=answer,
-                sources=sources,
+                sources=final_sources,
             ))
             conversation.updated_at = datetime.now(timezone.utc)
             db.commit()
@@ -726,6 +888,9 @@ def handle_chat_stream(request: ChatRequest, current_user: DBUser = Depends(get_
                 "type": "done",
                 "conversation_id": conversation.id,
                 "conversation_title": conversation.title,
+                "mode": mode,
+                "grounded": grounded,
+                "sources": final_sources,
             })
         except Exception as e:
             print(f"Chat stream error: {e}")
